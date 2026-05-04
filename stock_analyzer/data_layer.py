@@ -163,7 +163,7 @@ def collect_data(ticker: str) -> dict:
         native_currency = result["currency"]
         eur_rate = get_eur_rate(native_currency)
         result["eur_rate"]      = eur_rate
-        result["price_eur"]     = round(raw_price * eur_rate, 4) if (raw_price and eur_rate) else None
+        result["price_eur"]     = round(raw_price * eur_rate, 4) if (raw_price is not None and eur_rate is not None) else None
 
         result["market_cap"]        = _safe(info.get("marketCap"))
         result["shares_outstanding"]= _safe(info.get("sharesOutstanding"))
@@ -318,9 +318,9 @@ def collect_data(ticker: str) -> dict:
         mktcap = result["market_cap"]
         ev = result["enterprise_value"]
 
-        result["gross_margin"]     = _safe(gross_profit / revenue) if (revenue and gross_profit) else None
-        result["operating_margin"] = _safe(ebit / revenue) if (revenue and ebit) else None
-        result["net_margin"]       = _safe(net_income / revenue) if (revenue and net_income) else None
+        result["gross_margin"]     = _safe(gross_profit / revenue) if (revenue not in (None, 0) and gross_profit is not None) else None
+        result["operating_margin"] = _safe(ebit / revenue) if (revenue not in (None, 0) and ebit is not None) else None
+        result["net_margin"]       = _safe(net_income / revenue) if (revenue not in (None, 0) and net_income is not None) else None
 
         # EBITDA
         ebitda = None
@@ -331,9 +331,9 @@ def collect_data(ticker: str) -> dict:
         result["ebitda"] = ebitda
 
         # ROE, ROA
-        result["roe"]  = _safe(net_income / equity) if (net_income and equity and equity != 0) else None
+        result["roe"]  = _safe(net_income / equity) if (net_income is not None and equity not in (None, 0)) else None
         assets_last = _last(result["total_assets_5y"])
-        result["roa"]  = _safe(net_income / assets_last) if (net_income and assets_last) else None
+        result["roa"]  = _safe(net_income / assets_last) if (net_income is not None and assets_last not in (None, 0)) else None
 
         # ROIC  =  EBIT*(1-t) / (equity + net_debt)
         eff_tax = None
@@ -350,17 +350,17 @@ def collect_data(ticker: str) -> dict:
             result["roic"] = None
 
         # Debt ratios
-        result["debt_equity"]    = _safe(total_debt / equity) if (total_debt is not None and equity and equity != 0) else None
-        result["net_debt_ebitda"]= _safe(net_debt / ebitda) if (net_debt is not None and ebitda and ebitda != 0) else None
-        result["interest_coverage"] = _safe(abs(ebit) / abs(interest_exp)) if (ebit and interest_exp and interest_exp != 0) else None
-        result["current_ratio"]  = _safe(cur_a / cur_l) if (cur_a and cur_l and cur_l != 0) else None
+        result["debt_equity"]    = _safe(total_debt / equity) if (total_debt is not None and equity not in (None, 0)) else None
+        result["net_debt_ebitda"]= _safe(net_debt / ebitda) if (net_debt is not None and ebitda not in (None, 0)) else None
+        result["interest_coverage"] = _safe(abs(ebit) / abs(interest_exp)) if (ebit is not None and interest_exp not in (None, 0)) else None
+        result["current_ratio"]  = _safe(cur_a / cur_l) if (cur_a is not None and cur_l not in (None, 0)) else None
 
         # FCF yield
-        result["fcf_yield"] = _safe(fcf / mktcap) if (fcf and mktcap) else None
+        result["fcf_yield"] = _safe(fcf / mktcap) if (fcf is not None and mktcap not in (None, 0)) else None
 
         # EV multiples
-        result["ev_ebit"]  = _safe(ev / ebit) if (ev and ebit and ebit != 0) else None
-        result["ev_fcf"]   = _safe(ev / fcf)  if (ev and fcf and fcf != 0) else None
+        result["ev_ebit"]  = _safe(ev / ebit) if (ev is not None and ebit not in (None, 0)) else None
+        result["ev_fcf"]   = _safe(ev / fcf)  if (ev is not None and fcf not in (None, 0)) else None
 
         # ── growth CAGRs (single pass per list via indexed valid values) ──
         def _list_cagr(lst, require_positive_start=False):
@@ -388,12 +388,25 @@ def collect_data(ticker: str) -> dict:
         else:
             result["shares_change_pct"] = None
 
-        # Capex / revenue (trailing average)
+        # Gross capex / revenue (trailing average)
         capex_ratios = []
         for r, c in zip(result["revenue_5y"], result["capex_5y"]):
             if r and c and r != 0:
                 capex_ratios.append(abs(c) / r)
         result["capex_pct_revenue"] = float(np.mean(capex_ratios)) if capex_ratios else None
+
+        # Net capex / revenue = (capex - D&A) / revenue — the real reinvestment burden.
+        # D&A is already absorbed in operating margins, so only the excess over D&A
+        # represents true cash outflow beyond what the income statement reflects.
+        net_capex_ratios = []
+        dep_5y = result.get("depreciation_5y") or []
+        for r, c, d in zip(result["revenue_5y"], result["capex_5y"], dep_5y):
+            if r and c and r != 0:
+                gross_cx = abs(c)
+                da       = abs(d) if d else 0.0
+                net_cx   = max(gross_cx - da, 0.0)   # floor at 0: D&A can't "fund" capex
+                net_capex_ratios.append(net_cx / r)
+        result["net_capex_pct_revenue"] = float(np.mean(net_capex_ratios)) if net_capex_ratios else None
 
         # ── price history (1Y daily, 5Y monthly) ──────────────────────────
         end_dt   = datetime.today()
@@ -432,16 +445,16 @@ def collect_data(ticker: str) -> dict:
         try:
             p_now = price
             p_1y_ago = float(close_1y.iloc[0]) if len(close_1y) >= 200 else None
-            result["return_1y"] = _safe((p_now - p_1y_ago) / p_1y_ago) if (p_now and p_1y_ago) else None
+            result["return_1y"] = _safe((p_now - p_1y_ago) / p_1y_ago) if (p_now is not None and p_1y_ago not in (None, 0)) else None
         except Exception:
             result["return_1y"] = None
 
         # 3Y return — derived from already-fetched 5Y monthly series (no extra API call)
         try:
             # 5Y monthly has ~60 bars; 3 years back ≈ bar index 36 from the end
-            if len(close_5y) >= 36 and price:
+            if len(close_5y) >= 36 and price is not None:
                 p_3y_ago = float(close_5y.iloc[-36])
-                result["return_3y"] = _safe((price - p_3y_ago) / p_3y_ago)
+                result["return_3y"] = _safe((price - p_3y_ago) / p_3y_ago) if p_3y_ago != 0 else None
             else:
                 result["return_3y"] = None
         except Exception:

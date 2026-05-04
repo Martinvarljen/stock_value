@@ -17,6 +17,7 @@ Requires: openpyxl  (pip install openpyxl)
 """
 
 from datetime import datetime
+from pathlib import Path
 
 try:
     from openpyxl import Workbook
@@ -1275,7 +1276,10 @@ def write_excel(results: list[dict], filepath: str = None) -> str:
 
     if filepath is None:
         date_str = datetime.today().strftime("%Y%m%d_%H%M")
-        filepath = f"stock_analysis_{date_str}.xlsx"
+        filename = f"stock_analysis_{date_str}.xlsx"
+        # Default output: save into repo root (Finance folder), not stock_analyzer/
+        repo_root = Path(__file__).resolve().parents[1]
+        filepath = str(repo_root / filename)
 
     wb = Workbook()
     # Remove the default empty sheet

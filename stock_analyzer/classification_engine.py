@@ -39,10 +39,8 @@ def classify_stock(record: dict) -> dict:
     buy_below      = record.get("buy_below_price")
     critical_flags = record.get("critical_flags") or []
     red_flags      = record.get("red_flags") or []
-    high_rf        = [f for f in red_flags if f["severity"] == "HIGH"]
-    medium_rf      = [f for f in red_flags if f["severity"] == "MEDIUM"]
-
-    val_metrics = record.get("valuation_metrics") or {}
+    high_rf        = [f for f in red_flags if (f.get("severity") == "HIGH")]
+    medium_rf      = [f for f in red_flags if (f.get("severity") == "MEDIUM")]
 
     upside = None
     if price and fair_value and price > 0:
@@ -127,6 +125,17 @@ def classify_stock(record: dict) -> dict:
                 f"Market implies revenue contraction ({_pct(implied_growth)}) at current price"
             )
 
+    # ── 3b. Sector growth sanity — “train already left” ───────────────────
+    sector_ctx = record.get("sector_result") or {}
+    cagr_range = sector_ctx.get("growth_cagr_range")
+    if isinstance(cagr_range, (tuple, list)) and len(cagr_range) == 2:
+        _, cagr_ceiling = cagr_range
+        if implied_growth is not None and implied_growth > cagr_ceiling * 1.25 and implied_growth > 0.10:
+            reasons_against.append(
+                f"Growth expectations look stretched for the sector: reverse DCF implies {_pct(implied_growth)} "
+                f"vs typical {sector_ctx.get('sector') or 'sector'} ceiling ~{_pct(cagr_ceiling)}"
+            )
+
     # ── 4. Revenue growth ─────────────────────────────────────────────────
     rev_cagr = record.get("revenue_cagr_5y")
     if rev_cagr is not None:
@@ -209,7 +218,7 @@ def classify_stock(record: dict) -> dict:
         else:
             classification = "WATCHLIST"
 
-    elif upside is not None and upside > -0.15:
+    elif upside is not None and upside > -0.20:
         classification = "HOLD"
 
     elif upside is not None and upside > -0.25:

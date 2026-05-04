@@ -45,10 +45,22 @@ def _configure_console_output() -> None:
 #         automatically divides by 100 to convert to GBP.
 
 TICKERS = [
-    "SXR8.DE",    # iShares Core S&P 500 UCITS ETF USD (Acc)
-    "VWCE.DE",    # Vanguard FTSE All-World UCITS ETF USD Accumulation
-    "MSFT",       # Microsoft
-    "ITB",        # iShares U.S. Home Construction ETF
+    "MAIN",    # Mainstreet Capital
+    "BTI",     # British American Tobacco (US ADR)
+    "SHEL",    # Shell (US-listed)
+    "O",       # Realty Income
+    "MNG.L",   # M&G plc (London)
+    "AGNC",    # AGNC Investment
+    "BMO",     # Bank of Montreal
+    "BNS",     # Bank of Nova Scotia
+    "BMW.DE",  # BMW (Frankfurt)
+    "CNQ",     # Canadian Natural Resources
+    "MBG.DE",  # Mercedes-Benz (Frankfurt)
+    "PFE",     # Pfizer
+    "RIO",     # Rio Tinto (US ADR)
+    "STAG",    # STAG Industrial
+    "TD",      # Toronto-Dominion Bank
+    "UPS",     # UPS
 ]
 
 MARGIN_OF_SAFETY = 0.3   # 30 % default
@@ -84,9 +96,10 @@ def analyze(tickers: list[str]) -> list[dict]:
 
         # Phase 3  valuation (WACC + DCF + buy-below), with sector WACC override
         valuation_result = analyze_valuation(
-            data,
+            {**data, "sector_result": sector_result},
             margin_of_safety=MARGIN_OF_SAFETY,
             wacc_adjustment=sector_result["wacc_adjustment"],
+            terminal_growth_range=sector_result.get("terminal_growth_range"),
         )
 
         # Phase 4  growth trajectory + risk profile
@@ -136,6 +149,9 @@ def analyze(tickers: list[str]) -> list[dict]:
         record["backtest_metrics"]   = backtest_result["backtest_metrics"]
         record["backtest_flags"]     = backtest_result["backtest_flags"]
 
+        # Needed by classify_stock() sector growth sanity check (classification section 3b)
+        record["sector_result"]      = sector_result
+
         # Classification — needs the full record assembled above
         clf_result = classify_stock(record)
         record["classification_result"] = clf_result
@@ -145,7 +161,6 @@ def analyze(tickers: list[str]) -> list[dict]:
         explanation_result = generate_explanation(record)
 
         # Store remaining results in the record for peer comparison and Excel
-        record["sector_result"]      = sector_result
         record["explanation"]        = explanation_result
 
         results.append(record)
@@ -204,9 +219,17 @@ def _print_index(results: list[dict]):
         clf       = r.get("classification", "N/A")
 
         native    = f"{curr} {price:.2f}" if price else "N/A"
+        eur_rate  = r.get("eur_rate")
         if price_eur and curr != "EUR":
             native += f" (€{price_eur:.2f})"
-        fv_str    = f"€{fv:.2f}" if fv else "N/A"
+        if fv is None:
+            fv_str = "N/A"
+        elif curr == "EUR":
+            fv_str = f"€{fv:.2f}"
+        else:
+            fv_str = f"{curr} {fv:.2f}"
+            if eur_rate:
+                fv_str += f" (€{fv * eur_rate:.2f})"
         upside    = f"{(fv-price)/price:+.0%}" if (fv and price and price > 0) else "N/A"
         crit      = "  " if r.get("critical_flags") else ""
 

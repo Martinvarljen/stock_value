@@ -223,10 +223,20 @@ def run_all_scenarios(data: dict, wacc: float) -> dict:
     shares    = data.get("shares_outstanding")
 
     dyn_weights = calculate_dynamic_weights(data)
+    tg_range = data.get("terminal_growth_range")
+    if isinstance(tg_range, (tuple, list)) and len(tg_range) == 2:
+        tg_floor, tg_ceiling = tg_range
+    else:
+        tg_floor, tg_ceiling = None, None
 
     results = {}
     for name, params in SCENARIO_PARAMS.items():
         adjusted = {**params, "probability": dyn_weights[name]}
+        # Sector-specific realism: clamp terminal growth into sector range if provided.
+        if tg_floor is not None and tg_ceiling is not None:
+            adjusted_tg = adjusted.get("terminal_growth")
+            if adjusted_tg is not None:
+                adjusted["terminal_growth"] = max(tg_floor, min(adjusted_tg, tg_ceiling))
         results[name] = run_scenario(
             revenue=revenue, base_growth=growth, base_margin=margin,
             tax_rate=tax, capex_pct=capex_pct, wacc=wacc,

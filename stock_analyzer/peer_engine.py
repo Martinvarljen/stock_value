@@ -48,8 +48,14 @@ def _rank_group(records: list[dict], metric_key: str, higher_is_better: bool) ->
     pairs.sort(key=lambda x: x[1], reverse=higher_is_better)
 
     ranks = {}
-    for i, (ticker, _) in enumerate(pairs, 1):
-        ranks[ticker] = i
+    last_val = object()
+    last_rank = 0
+    for i, (ticker, val) in enumerate(pairs, 1):
+        # Dense ranking with ties: 10, 10, 9 → ranks 1,1,3 (not 1,1,2)
+        if val != last_val:
+            last_rank = i
+            last_val = val
+        ranks[ticker] = last_rank
 
     # Missing data → rank last
     n = len(records)
@@ -106,13 +112,19 @@ def analyze_peers(records: list[dict]) -> dict:
                 "classification": (r.get("classification_result") or {}).get("classification", "N/A"),
                 "metrics":  {},
             }
+            curr = r.get("currency", "")
             for mk, label, hib, fmt in _PEER_METRICS:
                 val = r.get(mk)
+                if val is not None and mk == "fair_value_weighted":
+                    formatted = f"{curr} {val:.0f}" if curr else f"{val:.0f}"
+                else:
+                    formatted = fmt(val) if val is not None else "N/A"
+                out_of = len([x for x in group if x.get(mk) is not None])
                 row["metrics"][mk] = {
                     "value":     val,
-                    "formatted": fmt(val) if val is not None else "N/A",
-                    "rank":      metric_ranks.get(mk, {}).get(ticker),
-                    "out_of":    len([x for x in group if x.get(mk) is not None]),
+                    "formatted": formatted,
+                    "rank":      metric_ranks.get(mk, {}).get(ticker) if val is not None else None,
+                    "out_of":    out_of,
                     "label":     label,
                 }
 

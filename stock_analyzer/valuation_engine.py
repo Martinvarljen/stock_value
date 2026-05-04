@@ -23,6 +23,11 @@ EQUITY_RISK_PREM = 0.055   # Damodaran long-run ERP
 DEFAULT_COST_OF_DEBT = 0.045
 DEFAULT_TAX_RATE     = 0.22
 
+# Sectors where trailing revenue CAGR is commodity-price-driven, not structural.
+# For these, DCF uses 5Y average revenue (mid-cycle) and floors growth at 0%.
+CYCLICAL_SECTORS      = {"Energy", "Basic Materials"}
+CYCLICAL_GROWTH_FLOOR = 0.00   # long-run: no permanent revenue contraction assumed
+
 # Damodaran-style sector median multiples (updated ~2024)
 SECTOR_BENCHMARKS = {
     "Technology":             {"pe": 28, "ev_ebitda": 18, "ev_ebit": 22, "pb": 6.0, "fcf_yield": 0.030},
@@ -353,7 +358,12 @@ def _sector_comparison(data: dict) -> dict | None:
 
 # ── main function ──────────────────────────────────────────────────────────────
 
-def analyze_valuation(data: dict, margin_of_safety: float = 0.25, wacc_adjustment: float = 0.0) -> dict:
+def analyze_valuation(
+    data: dict,
+    margin_of_safety: float = 0.25,
+    wacc_adjustment: float = 0.0,
+    terminal_growth_range: tuple[float, float] | None = None,
+) -> dict:
     """
     Full valuation analysis. Returns a flat dict of metric blocks.
     wacc_adjustment: sector-specific float to add to the CAPM WACC (from sector_engine).
@@ -400,127 +410,271 @@ def analyze_valuation(data: dict, margin_of_safety: float = 0.25, wacc_adjustmen
         ),
     }
 
-    # ── Run 3-scenario DCF ────────────────────────────────────────────────
-    scenarios = run_all_scenarios(data, wacc)
+    # ── Cyclical sector normalization ─────────────────────────────────────
+    # For Energy and Basic Materials, trailing revenue CAGR reflects commodity
+    # price cycles, not the structural outlook of the business.  We replace the
+    # DCF base with (a) the 5Y average revenue (mid-cycle normalisation) and
+    # (b) a growth-rate floor of 0% so the model never assumes permanent decline.
+    sector      = data.get("sector") or ""
+    dcf_data    = dict(data)   # shallow copy; we may override revenue / growth
+    cyclical_note = ""
+    skip_dcf = False
 
-    revenue   = data.get("revenue")
-    if revenue is None:
-        flags.append("No revenue data — DCF cannot be calculated")
-        return {"valuation_metrics": metrics, "valuation_flags": flags,
-                "scenarios": scenarios, "wacc_data": wacc_data,
-                "fair_value_weighted": None, "buy_below_price": None}
+    # Sector-specific terminal growth realism: passed in from sector_engine.
+    if terminal_growth_range and isinstance(terminal_growth_range, (tuple, list)) and len(terminal_growth_range) == 2:
+        dcf_data["terminal_growth_range"] = terminal_growth_range
+        dcf_data["terminal_growth_range_note"] = f"Terminal growth clamped to {terminal_growth_range[0]:.1%}–{terminal_growth_range[1]:.1%} (sector range)"
 
-    # Inputs summary
-    metrics["dcf_inputs"] = {
-        "label":     "DCF Inputs",
-        "value":     None,
-        "formatted": "",
-        "assessment": (
-            f"Base revenue: {_bn(revenue)}  "
-            f"| Base growth (5Y CAGR): {_pct(data.get('revenue_cagr_5y'))}  "
-            f"| Base op. margin: {_pct(data.get('operating_margin'))}  "
-            f"| Tax rate: {_pct(data.get('effective_tax_rate') or DEFAULT_TAX_RATE)}  "
-            f"| Capex/revenue: {_pct(data.get('capex_pct_revenue'))}"
-        ),
-        "benchmark": "All inputs derived from trailing 5Y financials — no analyst estimates",
-        "detail":    f"Net debt: {_bn(data.get('net_debt'))}  | Shares: {_bn(data.get('shares_outstanding'))}",
-    }
-
-    # Per-scenario results
-    for name in ["bear", "base", "bull"]:
-        s = scenarios.get(name)
-        if s is None:
-            continue
-        tv_flag = ""
-        if s.get("tv_pct_of_ev") is not None and s["tv_pct_of_ev"] > 0.75:
-            tv_flag = f"   Terminal value is {s['tv_pct_of_ev']:.0%} of total EV — heavily assumption-dependent"
-            if s["tv_pct_of_ev"] > 0.80:
-                flags.append(f"{name.title()} case: terminal value = {s['tv_pct_of_ev']:.0%} of EV — treat with caution")
-
-        metrics[f"dcf_{name}"] = {
-            "label":     f"DCF {name.title()} Case",
-            "value":     s.get("per_share_value"),
-            "formatted": _num(s.get("per_share_value")),
-            "assessment": (
-                f"Growth {_pct(s['growth_rate'])} / Margin {_pct(s['operating_margin'])} / "
-                f"Terminal {_pct(s['terminal_growth'])} → "
-                f"EV {_bn(s['enterprise_value'])}, equity {_bn(s['equity_value'])}"
-                + tv_flag
-            ),
-            "benchmark": f"Probability weight: {SCENARIO_PARAMS[name]['probability']:.0%}",
-            "detail": (
-                f"PV of FCFs: {_bn(s['pv_fcfs'])}  "
-                f"| PV of terminal value: {_bn(s['pv_terminal_value'])}  "
-                f"| Terminal % of EV: {_pct(s.get('tv_pct_of_ev'))}"
-            ),
+    # DCF is structurally unreliable for banks/insurers/brokers; prefer P/B + ROE.
+    if sector == "Financial Services":
+        flags.append("DCF skipped for Financial Services — use P/B, ROE, and dividend yield as primary valuation tools")
+        skip_dcf = True
+        metrics["dcf_inputs"] = {
+            "label":     "DCF Inputs",
+            "value":     None,
+            "formatted": "",
+            "assessment": "DCF not applied for Financial Services (cash flows and leverage structure make DCF unreliable).",
+            "benchmark": "Use P/B vs ROE vs cost of equity; cross-check with dividend yield and credit-cycle risk.",
+            "detail":    "",
+        }
+        metrics["fair_value_weighted"] = {
+            "label":     "Probability-Weighted Fair Value",
+            "value":     None,
+            "formatted": "N/A",
+            "assessment": "Not calculated for Financial Services",
+            "benchmark": "",
+            "detail":    "",
+        }
+        metrics["buy_below_price"] = {
+            "label":     f"Buy-Below Price ({margin_of_safety:.0%} margin of safety)",
+            "value":     None,
+            "formatted": "N/A",
+            "assessment": "Not calculated (DCF not applicable for this sector)",
+            "benchmark": "",
+            "detail":    "",
+        }
+        metrics["price_vs_fair_value"] = {
+            "label": "Current Price vs Fair Value",
+            "value": None,
+            "formatted": "N/A",
+            "assessment": "DCF fair value not computed for this sector",
+            "benchmark": "",
+            "detail": "",
+        }
+        metrics["reverse_dcf"] = {
+            "label": "Reverse DCF — Implied Growth",
+            "value": None,
+            "formatted": "N/A",
+            "assessment": "Not applicable (DCF not computed for this sector)",
+            "benchmark": "",
+            "detail": "",
         }
 
-    # Probability-weighted fair value
-    fair_value = _weighted_per_share(scenarios)
-    metrics["fair_value_weighted"] = {
-        "label":     "Probability-Weighted Fair Value",
-        "value":     fair_value,
-        "formatted": _num(fair_value),
-        "assessment": (
-            f"25% Bear ({_num(scenarios['bear'].get('per_share_value') if scenarios.get('bear') else None)})  +  "
-            f"50% Base ({_num(scenarios['base'].get('per_share_value') if scenarios.get('base') else None)})  +  "
-            f"25% Bull ({_num(scenarios['bull'].get('per_share_value') if scenarios.get('bull') else None)})"
-            if fair_value else "Cannot calculate — missing scenario data"
-        ),
-        "benchmark": "This is a DCF estimate, not a guarantee. Treat as a range, not a precise target.",
-        "detail":    "Weighted: 25% bear + 50% base + 25% bull",
-    }
+    if sector in CYCLICAL_SECTORS:
+        rev_5y = [r for r in (data.get("revenue_5y") or []) if r is not None and r > 0]
+        trailing_rev    = data.get("revenue")
+        trailing_growth = data.get("revenue_cagr_5y") or 0.0
 
-    # Buy-below price
-    buy_below = fair_value * (1 - margin_of_safety) if fair_value else None
-    metrics["buy_below_price"] = {
-        "label":     f"Buy-Below Price ({margin_of_safety:.0%} margin of safety)",
-        "value":     buy_below,
-        "formatted": _num(buy_below),
-        "assessment": (
-            f"Fair value {_num(fair_value)} × (1 − {margin_of_safety:.0%}) = {_num(buy_below)}"
-            if buy_below else "Cannot calculate"
-        ),
-        "benchmark": f"{margin_of_safety:.0%} margin of safety means paying at most {1-margin_of_safety:.0%} of estimated fair value",
-        "detail":    "Provides a buffer for DCF estimation errors and unexpected downturns",
-    }
+        norm_rev    = sum(rev_5y) / len(rev_5y) if len(rev_5y) >= 3 else trailing_rev
+        norm_growth = max(trailing_growth, CYCLICAL_GROWTH_FLOOR)
 
-    # Current price vs fair value
-    price = data.get("current_price")
-    if price and fair_value:
-        upside = (fair_value - price) / price
-        if buy_below:
-            if price <= buy_below:
-                zone = f"IN BUY ZONE (price {_num(price)} ≤ buy-below {_num(buy_below)})"
-            elif price <= fair_value:
-                zone = f"WATCHLIST (above buy-below {_num(buy_below)}, below fair value {_num(fair_value)})"
-            else:
-                zone = f"ABOVE FAIR VALUE (overvalued by {abs(upside):.1%})"
+        dcf_data["revenue"]         = norm_rev
+        dcf_data["revenue_cagr_5y"] = norm_growth
+
+        # Use net capex (capex − D&A) for cyclical sectors — gross capex would
+        # double-count the D&A already embedded in operating margins.
+        net_cx = data.get("net_capex_pct_revenue")
+        gross_cx = data.get("capex_pct_revenue")
+        if net_cx is not None:
+            dcf_data["capex_pct_revenue"] = net_cx
+
+        changes = []
+        if norm_rev and trailing_rev and abs(norm_rev - trailing_rev) / trailing_rev > 0.01:
+            changes.append(
+                f"revenue {_bn(trailing_rev)} → {_bn(norm_rev)} (5Y avg mid-cycle)"
+            )
+        if norm_growth != trailing_growth:
+            changes.append(
+                f"growth {_pct(trailing_growth)} → {_pct(norm_growth)} (floored at 0%)"
+            )
+        if net_cx is not None and gross_cx is not None and abs(net_cx - gross_cx) > 0.005:
+            changes.append(
+                f"capex {_pct(gross_cx)} → {_pct(net_cx)} (net of D&A)"
+            )
+        if changes:
+            cyclical_note = (
+                "  [Cyclical normalisation applied: " + "; ".join(changes) + "]"
+            )
+            flags.append(
+                f"Cyclical sector ({sector}): DCF inputs normalised — {'; '.join(changes)}"
+            )
+
+    # ── Sector growth context (the “train already left” check) ────────────
+    sector_ctx = data.get("sector_result") or {}
+    cagr_range = sector_ctx.get("growth_cagr_range")
+    trailing_growth = data.get("revenue_cagr_5y")
+    if isinstance(cagr_range, (tuple, list)) and len(cagr_range) == 2 and trailing_growth is not None:
+        cagr_floor, cagr_ceiling = cagr_range
+        if trailing_growth > cagr_ceiling:
+            flags.append(
+                f"Trailing revenue CAGR {_pct(trailing_growth)} is unusually high for {sector} "
+                f"(typical ceiling ~{_pct(cagr_ceiling)}) — expectations risk / mean reversion likely"
+            )
+            metrics["sector_growth_context"] = {
+                "label":     "Sector Growth Context",
+                "value":     trailing_growth,
+                "formatted": _pct(trailing_growth),
+                "assessment": (
+                    f"Trailing growth exceeds typical {sector} range "
+                    f"{cagr_floor:.0%}–{cagr_ceiling:.0%} — risk that market already priced the growth"
+                ),
+                "benchmark": f"Typical {sector} revenue CAGR band: {cagr_floor:.0%}–{cagr_ceiling:.0%}",
+                "detail":    "High trailing growth often mean-reverts; focus on durability and price paid",
+            }
         else:
-            zone = "N/A"
+            metrics["sector_growth_context"] = {
+                "label":     "Sector Growth Context",
+                "value":     trailing_growth,
+                "formatted": _pct(trailing_growth),
+                "assessment": f"Within typical {sector} revenue CAGR band ({cagr_floor:.0%}–{cagr_ceiling:.0%})",
+                "benchmark": f"Typical {sector} revenue CAGR band: {cagr_floor:.0%}–{cagr_ceiling:.0%}",
+                "detail":    "",
+            }
 
-        metrics["price_vs_fair_value"] = {
-            "label":     "Current Price vs Fair Value",
-            "value":     upside,
-            "formatted": f"{upside:+.1%}",
-            "assessment": zone,
-            "benchmark": "Negative = overvalued vs DCF, positive = undervalued",
-            "detail": (
-                f"Current price: {_num(price)}  "
-                f"| Fair value: {_num(fair_value)}  "
-                f"| Buy-below: {_num(buy_below)}  "
-                f"| Upside to fair value: {upside:+.1%}"
-            ),
-        }
+    scenarios = {}
+    fair_value = None
+    buy_below = None
+    tv_sens = None
 
-        if upside < -0.30:
-            flags.append(f"Current price is {abs(upside):.0%} above estimated fair value")
-    else:
-        metrics["price_vs_fair_value"] = {
-            "label": "Current Price vs Fair Value", "value": None,
-            "formatted": "N/A", "assessment": "Price or fair value unavailable",
-            "benchmark": "", "detail": "",
-        }
+    if not skip_dcf:
+        # ── Run 3-scenario DCF ────────────────────────────────────────────
+        scenarios = run_all_scenarios(dcf_data, wacc)
+
+        revenue   = dcf_data.get("revenue")
+        if revenue is None:
+            flags.append("No revenue data — DCF cannot be calculated")
+        else:
+            # Inputs summary
+            metrics["dcf_inputs"] = {
+                "label":     "DCF Inputs",
+                "value":     None,
+                "formatted": "",
+                "assessment": (
+                    f"Base revenue: {_bn(revenue)}  "
+                    f"| Base growth (5Y CAGR): {_pct(dcf_data.get('revenue_cagr_5y'))}  "
+                    f"| Base op. margin: {_pct(data.get('operating_margin'))}  "
+                    f"| Tax rate: {_pct(data.get('effective_tax_rate') or DEFAULT_TAX_RATE)}  "
+                    f"| Capex/revenue: {_pct(data.get('capex_pct_revenue'))}"
+                    + cyclical_note
+                    + (
+                        f"  |  {dcf_data.get('terminal_growth_range_note')}"
+                        if dcf_data.get("terminal_growth_range_note")
+                        else ""
+                    )
+                ),
+                "benchmark": (
+                    "Inputs normalised to mid-cycle (5Y avg revenue, 0% growth floor) — cyclical sector"
+                    if cyclical_note else
+                    "All inputs derived from trailing 5Y financials — no analyst estimates"
+                ),
+                "detail":    f"Net debt: {_bn(data.get('net_debt'))}  | Shares: {_bn(data.get('shares_outstanding'))}",
+            }
+
+            # Per-scenario results
+            for name in ["bear", "base", "bull"]:
+                s = scenarios.get(name)
+                if s is None:
+                    continue
+                tv_flag = ""
+                if s.get("tv_pct_of_ev") is not None and s["tv_pct_of_ev"] > 0.75:
+                    tv_flag = f"   Terminal value is {s['tv_pct_of_ev']:.0%} of total EV — heavily assumption-dependent"
+                    if s["tv_pct_of_ev"] > 0.80:
+                        flags.append(f"{name.title()} case: terminal value = {s['tv_pct_of_ev']:.0%} of EV — treat with caution")
+
+                metrics[f"dcf_{name}"] = {
+                    "label":     f"DCF {name.title()} Case",
+                    "value":     s.get("per_share_value"),
+                    "formatted": _num(s.get("per_share_value")),
+                    "assessment": (
+                        f"Growth {_pct(s['growth_rate'])} / Margin {_pct(s['operating_margin'])} / "
+                        f"Terminal {_pct(s['terminal_growth'])} → "
+                        f"EV {_bn(s['enterprise_value'])}, equity {_bn(s['equity_value'])}"
+                        + tv_flag
+                    ),
+                    "benchmark": f"Probability weight: {SCENARIO_PARAMS[name]['probability']:.0%}",
+                    "detail": (
+                        f"PV of FCFs: {_bn(s['pv_fcfs'])}  "
+                        f"| PV of terminal value: {_bn(s['pv_terminal_value'])}  "
+                        f"| Terminal % of EV: {_pct(s.get('tv_pct_of_ev'))}"
+                    ),
+                }
+
+            # Probability-weighted fair value
+            fair_value = _weighted_per_share(scenarios)
+            metrics["fair_value_weighted"] = {
+                "label":     "Probability-Weighted Fair Value",
+                "value":     fair_value,
+                "formatted": _num(fair_value),
+                "assessment": (
+                    f"25% Bear ({_num(scenarios['bear'].get('per_share_value') if scenarios.get('bear') else None)})  +  "
+                    f"50% Base ({_num(scenarios['base'].get('per_share_value') if scenarios.get('base') else None)})  +  "
+                    f"25% Bull ({_num(scenarios['bull'].get('per_share_value') if scenarios.get('bull') else None)})"
+                    if fair_value else "Cannot calculate — missing scenario data"
+                ),
+                "benchmark": "This is a DCF estimate, not a guarantee. Treat as a range, not a precise target.",
+                "detail":    "Weighted: 25% bear + 50% base + 25% bull",
+            }
+
+            # Buy-below price
+            buy_below = fair_value * (1 - margin_of_safety) if fair_value else None
+            metrics["buy_below_price"] = {
+                "label":     f"Buy-Below Price ({margin_of_safety:.0%} margin of safety)",
+                "value":     buy_below,
+                "formatted": _num(buy_below),
+                "assessment": (
+                    f"Fair value {_num(fair_value)} × (1 − {margin_of_safety:.0%}) = {_num(buy_below)}"
+                    if buy_below else "Cannot calculate"
+                ),
+                "benchmark": f"{margin_of_safety:.0%} margin of safety means paying at most {1-margin_of_safety:.0%} of estimated fair value",
+                "detail":    "Provides a buffer for DCF estimation errors and unexpected downturns",
+            }
+
+            # Current price vs fair value
+            price = data.get("current_price")
+            if price and fair_value:
+                upside = (fair_value - price) / price
+                if buy_below:
+                    if price <= buy_below:
+                        zone = f"IN BUY ZONE (price {_num(price)} ≤ buy-below {_num(buy_below)})"
+                    elif price <= fair_value:
+                        zone = f"WATCHLIST (above buy-below {_num(buy_below)}, below fair value {_num(fair_value)})"
+                    else:
+                        zone = f"ABOVE FAIR VALUE (overvalued by {abs(upside):.1%})"
+                else:
+                    zone = "N/A"
+
+                metrics["price_vs_fair_value"] = {
+                    "label":     "Current Price vs Fair Value",
+                    "value":     upside,
+                    "formatted": f"{upside:+.1%}",
+                    "assessment": zone,
+                    "benchmark": "Negative = overvalued vs DCF, positive = undervalued",
+                    "detail": (
+                        f"Current price: {_num(price)}  "
+                        f"| Fair value: {_num(fair_value)}  "
+                        f"| Buy-below: {_num(buy_below)}  "
+                        f"| Upside to fair value: {upside:+.1%}"
+                    ),
+                }
+
+                if upside < -0.30:
+                    flags.append(f"Current price is {abs(upside):.0%} above estimated fair value")
+            else:
+                metrics["price_vs_fair_value"] = {
+                    "label": "Current Price vs Fair Value", "value": None,
+                    "formatted": "N/A", "assessment": "Price or fair value unavailable",
+                    "benchmark": "", "detail": "",
+                }
 
     # ── Historical P/E range ──────────────────────────────────────────────
     pe_hist = _pe_history_position(data)
@@ -650,11 +804,21 @@ def analyze_valuation(data: dict, margin_of_safety: float = 0.25, wacc_adjustmen
     sector_comp = _sector_comparison(data)
 
     # ── Terminal value sensitivity grid ───────────────────────────────────
-    tv_sens = _tv_sensitivity(data, wacc)
+    tv_sens = None if skip_dcf else _tv_sensitivity(dcf_data, wacc)
 
     # ── Reverse DCF ───────────────────────────────────────────────────────
-    rdcf = _reverse_dcf(data, wacc)
+    rdcf = None if skip_dcf else _reverse_dcf(data, wacc)
     if rdcf:
+        # Add “train already left” check: implied growth vs sector ceiling.
+        cagr_range = (data.get("sector_result") or {}).get("growth_cagr_range")
+        if isinstance(cagr_range, (tuple, list)) and len(cagr_range) == 2:
+            _, cagr_ceiling = cagr_range
+            implied_g = rdcf.get("implied_growth")
+            if implied_g is not None and implied_g > cagr_ceiling * 1.25 and implied_g > 0.10:
+                flags.append(
+                    f"Reverse DCF implies {_pct(implied_g)} revenue CAGR, far above typical {sector} ceiling "
+                    f"({_pct(cagr_ceiling)}) — growth expectations likely already priced in"
+                )
         metrics["reverse_dcf"] = {
             "label":     "Reverse DCF — Implied Growth",
             "value":     rdcf["implied_growth"],
@@ -667,11 +831,12 @@ def analyze_valuation(data: dict, margin_of_safety: float = 0.25, wacc_adjustmen
             ),
         }
     else:
-        metrics["reverse_dcf"] = {
-            "label": "Reverse DCF — Implied Growth", "value": None,
-            "formatted": "N/A", "assessment": "Insufficient data",
-            "benchmark": "", "detail": "",
-        }
+        if "reverse_dcf" not in metrics:
+            metrics["reverse_dcf"] = {
+                "label": "Reverse DCF — Implied Growth", "value": None,
+                "formatted": "N/A", "assessment": "Insufficient data",
+                "benchmark": "", "detail": "",
+            }
 
     return {
         "valuation_metrics": metrics,

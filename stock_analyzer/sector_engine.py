@@ -23,6 +23,7 @@ SECTOR_CONFIGS = {
     "Technology": {
         "wacc_adj":   +0.005,
         "tg_range":   (0.020, 0.035),
+        "cagr_range": (0.05, 0.20),  # typical sustainable revenue CAGR band (rough)
         "key_metrics": ["revenue_cagr_5y", "gross_margin", "roic", "sbc_burden", "ev_fcf"],
         "risks": [
             "Rapid product obsolescence — moats erode faster than in other sectors",
@@ -40,6 +41,7 @@ SECTOR_CONFIGS = {
     "Healthcare": {
         "wacc_adj":   0.000,
         "tg_range":   (0.018, 0.030),
+        "cagr_range": (0.03, 0.12),
         "key_metrics": ["revenue_cagr_5y", "operating_margin", "roic", "net_debt_ebitda", "fcf_yield"],
         "risks": [
             "Patent cliffs — blockbuster drugs lose exclusivity, revenue falls sharply",
@@ -57,6 +59,7 @@ SECTOR_CONFIGS = {
     "Financial Services": {
         "wacc_adj":   +0.005,
         "tg_range":   (0.015, 0.025),
+        "cagr_range": (0.01, 0.08),
         "key_metrics": ["roe", "pb_ratio", "net_margin", "dividend_yield", "revenue_cagr_5y"],
         "risks": [
             "Credit cycle risk — loan losses spike in downturns, hard to model with DCF",
@@ -74,6 +77,7 @@ SECTOR_CONFIGS = {
     "Consumer Cyclical": {
         "wacc_adj":   +0.003,
         "tg_range":   (0.015, 0.025),
+        "cagr_range": (0.02, 0.10),
         "key_metrics": ["revenue_cagr_5y", "operating_margin", "net_debt_ebitda", "fcf_yield", "ev_ebitda"],
         "risks": [
             "Earnings highly sensitive to consumer confidence and economic cycles",
@@ -90,6 +94,7 @@ SECTOR_CONFIGS = {
     "Consumer Defensive": {
         "wacc_adj":   -0.003,
         "tg_range":   (0.015, 0.025),
+        "cagr_range": (0.01, 0.07),
         "key_metrics": ["revenue_cagr_5y", "gross_margin", "dividend_yield", "net_debt_ebitda", "fcf_yield"],
         "risks": [
             "Private label competition compressing branded product margins",
@@ -106,6 +111,7 @@ SECTOR_CONFIGS = {
     "Industrials": {
         "wacc_adj":   +0.002,
         "tg_range":   (0.015, 0.025),
+        "cagr_range": (0.02, 0.09),
         "key_metrics": ["revenue_cagr_5y", "operating_margin", "roic", "capex_pct_revenue", "net_debt_ebitda"],
         "risks": [
             "Capital-intensive — high capex requirements limit free cash flow",
@@ -122,6 +128,7 @@ SECTOR_CONFIGS = {
     "Basic Materials": {
         "wacc_adj":   +0.010,
         "tg_range":   (0.010, 0.020),
+        "cagr_range": (-0.02, 0.06),
         "key_metrics": ["revenue_cagr_5y", "operating_margin", "net_debt_ebitda", "fcf_yield", "ev_ebitda"],
         "risks": [
             "Commodity price cycles — earnings highly volatile, hard to normalise",
@@ -138,6 +145,7 @@ SECTOR_CONFIGS = {
     "Energy": {
         "wacc_adj":   +0.008,
         "tg_range":   (0.010, 0.020),
+        "cagr_range": (-0.03, 0.05),
         "key_metrics": ["revenue_cagr_5y", "fcf_yield", "net_debt_ebitda", "ev_ebitda", "dividend_yield"],
         "risks": [
             "Oil/gas price cycles — revenue and earnings highly volatile",
@@ -155,6 +163,7 @@ SECTOR_CONFIGS = {
     "Utilities": {
         "wacc_adj":   -0.008,
         "tg_range":   (0.015, 0.025),
+        "cagr_range": (0.00, 0.05),
         "key_metrics": ["revenue_cagr_5y", "net_debt_ebitda", "dividend_yield", "interest_coverage", "fcf_yield"],
         "risks": [
             "Very high leverage — regulated returns require significant debt financing",
@@ -171,6 +180,7 @@ SECTOR_CONFIGS = {
     "Real Estate": {
         "wacc_adj":   -0.005,
         "tg_range":   (0.015, 0.025),
+        "cagr_range": (0.01, 0.06),
         "key_metrics": ["revenue_cagr_5y", "net_debt_ebitda", "fcf_yield", "dividend_yield", "pb_ratio"],
         "risks": [
             "High leverage typical — vulnerable to rising interest rates",
@@ -187,6 +197,7 @@ SECTOR_CONFIGS = {
     "Communication Services": {
         "wacc_adj":   +0.003,
         "tg_range":   (0.015, 0.025),
+        "cagr_range": (0.02, 0.10),
         "key_metrics": ["revenue_cagr_5y", "operating_margin", "ev_ebitda", "fcf_yield", "roic"],
         "risks": [
             "Subscriber/user growth slowing — mature streaming/social media markets",
@@ -204,6 +215,7 @@ SECTOR_CONFIGS = {
 _DEFAULT_CONFIG = {
     "wacc_adj":    0.000,
     "tg_range":    (0.015, 0.025),
+    "cagr_range":  (0.01, 0.08),
     "key_metrics": ["revenue_cagr_5y", "operating_margin", "roic", "net_debt_ebitda", "fcf_yield"],
     "risks":       [],
     "opportunities": [],
@@ -237,16 +249,20 @@ def apply_sector_context(data: dict) -> dict:
         flags.append(f"Sector risk: {risk}")
 
     tg_min, tg_max = cfg["tg_range"]
+    cagr_min, cagr_max = cfg.get("cagr_range", _DEFAULT_CONFIG["cagr_range"])
     return {
         "sector":               sector,
         "wacc_adjustment":      cfg["wacc_adj"],
         "terminal_growth_range": cfg["tg_range"],
+        "growth_cagr_range":    (cagr_min, cagr_max),
         "key_metrics":          cfg["key_metrics"],
         "sector_flags":         flags,
         "opportunities":        cfg.get("opportunities", []),
         "sector_note":          cfg.get("note", ""),
         "tg_floor":             tg_min,
         "tg_ceiling":           tg_max,
+        "cagr_floor":           cagr_min,
+        "cagr_ceiling":         cagr_max,
     }
 
 
