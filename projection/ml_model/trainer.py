@@ -2,12 +2,13 @@
 trainer.py — Train LightGBM projection models on historical price data.
 
 Trains binary classifiers for P(up 20d), P(up 60d), P(up 120d).
-Uses only technical features computed from OHLCV history (so we can go back in time).
+Uses extended OHLCV technical features (RSI, returns, vol, ATR, Bollinger %B,
+MACD vs price, MA spread, intraday range, volume).
 
 Run:
     cd Finance
     python projection/ml_model/trainer.py
-    python projection/ml_model/trainer.py --tickers AAPL MSFT GOOGL --lookback 3
+    python projection/ml_model/trainer.py --tickers AAPL MSFT --lookback 8 --sample-step 1
 
 Output:
     projection/ml_model/saved_models/lgbm_20d.pkl
@@ -26,22 +27,21 @@ import numpy as np
 import pandas as pd
 
 # Path setup
-_root = Path(__file__).resolve().parents[3]
+_root = Path(__file__).resolve().parents[2]  # Finance/ (contains stock_analyzer, projection)
 for _p in [str(_root / "stock_analyzer"), str(_root / "projection")]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from ml_model.features import TECH_FEATURES, extract_historical_features
+from ml_model.features import TECH_FEATURES, extract_historical_features, MIN_OHLCV_BARS
 
 MODELS_DIR = Path(__file__).parent / "saved_models"
 MODELS_DIR.mkdir(exist_ok=True)
 
 HORIZONS = [20, 60, 120]
-SAMPLE_STEP = 10        # sample one training point every N trading days
-MIN_HISTORY  = 210      # minimum days of price history required
+DEFAULT_SAMPLE_STEP = 3  # one row every N trading days (smaller = more data, slower)
 
-# Diversified S&P 500 training universe
-DEFAULT_TICKERS = [
+# Diversified large-cap training universe (deduped)
+_DEFAULT_CORE = [
     # Tech
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "ADBE", "CRM", "INTC", "AMD",
     "QCOM", "TXN", "AMAT", "MU", "AVGO", "LRCX", "KLAC", "SNPS", "CDNS", "IBM",
@@ -61,18 +61,33 @@ DEFAULT_TICKERS = [
     "O", "AMT", "PLD", "EQIX", "SPG", "WELL", "AVB", "EQR", "DLR", "PSA",
 ]
 
+_DEFAULT_EXTRA = [
+    "T", "VZ", "CMCSA", "DIS", "NFLX", "ORLY", "LOW", "TJX", "BKNG", "MAR",
+    "CME", "ICE", "SCHW", "TFC", "AIG", "MET", "PRU", "ALL", "TRV", "AON",
+    "ISRG", "SYK", "BSX", "MDT", "DHR", "TMO", "ABT", "CVS", "CI", "ELV",
+    "NOW", "PANW", "CRWD", "ZS", "DDOG", "V", "MA", "AXP", "MCO", "SPGI",
+    "ETN", "EMR", "PH", "ROK", "ITW", "FDX", "NSC", "CSX", "WM", "RSG",
+    "FCX", "NEM", "AA", "DOW", "CTVA", "FANG", "HES", "DVN", "BKR", "FTI",
+]
+
+DEFAULT_TICKERS = list(dict.fromkeys(_DEFAULT_CORE + _DEFAULT_EXTRA))
+
 
 # ── data collection ────────────────────────────────────────────────────────────
 
-def collect_training_data(tickers: list[str], lookback_years: int = 5) -> pd.DataFrame:
+def collect_training_data(
+    tickers: list[str],
+    lookback_years: int = 5,
+    sample_step: int = DEFAULT_SAMPLE_STEP,
+) -> pd.DataFrame:
     """
     Download historical OHLCV for each ticker and build training rows.
     Each row = technical features at date T + forward return labels.
     """
     import yfinance as yf
 
-    end_dt   = datetime.now()
-    start_dt = end_dt - timedelta(days=lookback_years * 365 + max(HORIZONS) + MIN_HISTORY + 30)
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(days=lookback_years * 365 + max(HORIZONS) + MIN_OHLCV_BARS + 30)
 
     all_rows: list[dict] = []
 
@@ -85,17 +100,17 @@ def collect_training_data(tickers: list[str], lookback_years: int = 5) -> pd.Dat
                 interval="1d",
             )
             if hist.empty:
-                print("— no data")
+                print("- no data")
                 continue
 
             hist.index = hist.index.tz_localize(None)
 
             # Need enough look-forward room
             max_fwd = int(max(HORIZONS) * 1.5)
-            tradeable_dates = hist.index[MIN_HISTORY:-max_fwd:SAMPLE_STEP]
+            tradeable_dates = hist.index[MIN_OHLCV_BARS:-max_fwd:sample_step]
 
             if len(tradeable_dates) == 0:
-                print("— too short")
+                print("- too short")
                 continue
 
             close = hist["Close"]
@@ -126,10 +141,10 @@ def collect_training_data(tickers: list[str], lookback_years: int = 5) -> pd.Dat
                     all_rows.append(row)
                     added += 1
 
-            print(f"→ {added} samples")
+            print(f"-> {added} samples")
 
         except Exception as e:
-            print(f"— error: {e}")
+            print(f"- error: {e}")
 
     df = pd.DataFrame(all_rows)
     print(f"\nTotal training samples: {len(df):,}  across {df['ticker'].nunique()} tickers")
@@ -138,10 +153,13 @@ def collect_training_data(tickers: list[str], lookback_years: int = 5) -> pd.Dat
 
 # ── training ───────────────────────────────────────────────────────────────────
 
-def train(df: pd.DataFrame | None = None,
-          tickers: list[str] | None = None,
-          lookback_years: int = 5,
-          save: bool = True) -> dict:
+def train(
+    df: pd.DataFrame | None = None,
+    tickers: list[str] | None = None,
+    lookback_years: int = 5,
+    save: bool = True,
+    sample_step: int = DEFAULT_SAMPLE_STEP,
+) -> dict:
     """
     Train LightGBM classifiers for each horizon.
     Returns dict {horizon: model}.
@@ -157,7 +175,7 @@ def train(df: pd.DataFrame | None = None,
 
     if df is None:
         print("Collecting training data...")
-        df = collect_training_data(tickers or DEFAULT_TICKERS, lookback_years)
+        df = collect_training_data(tickers or DEFAULT_TICKERS, lookback_years, sample_step)
 
     if df.empty:
         print("No training data available.")
@@ -177,38 +195,41 @@ def train(df: pd.DataFrame | None = None,
             print(f"  {h}d: skipped (only {len(sub)} samples)")
             continue
 
-        X = sub[feat_cols].values.astype(np.float32)
+        X_df = sub[feat_cols]
         y = sub[target_col].values.astype(int)
 
         # Time-series CV
-        tscv    = TimeSeriesSplit(n_splits=5)
+        tscv = TimeSeriesSplit(n_splits=5)
         cv_aucs = []
 
         lgbm_params = dict(
-            n_estimators=300,
-            learning_rate=0.04,
-            max_depth=5,
-            num_leaves=31,
-            min_child_samples=40,
-            subsample=0.8,
-            colsample_bytree=0.8,
+            n_estimators=800,
+            learning_rate=0.025,
+            max_depth=8,
+            num_leaves=63,
+            min_child_samples=25,
+            min_split_gain=0.001,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            reg_alpha=0.05,
+            reg_lambda=0.05,
             class_weight="balanced",
             random_state=42,
             verbose=-1,
         )
 
-        for train_idx, val_idx in tscv.split(X):
+        for train_idx, val_idx in tscv.split(X_df):
             m = lgb.LGBMClassifier(**lgbm_params)
-            m.fit(X[train_idx], y[train_idx])
-            prob = m.predict_proba(X[val_idx])[:, 1]
+            m.fit(X_df.iloc[train_idx], y[train_idx])
+            prob = m.predict_proba(X_df.iloc[val_idx])[:, 1]
             cv_aucs.append(roc_auc_score(y[val_idx], prob))
 
         mean_auc = float(np.mean(cv_aucs))
-        std_auc  = float(np.std(cv_aucs))
+        std_auc = float(np.std(cv_aucs))
 
         # Final model on all data
         final = lgb.LGBMClassifier(**lgbm_params)
-        final.fit(X, y)
+        final.fit(X_df, y)
 
         models[h] = final
         metrics[h] = {
@@ -224,18 +245,19 @@ def train(df: pd.DataFrame | None = None,
             import joblib
             path = MODELS_DIR / f"lgbm_{h}d.pkl"
             joblib.dump(final, path)
-            print(f"       saved → {path.name}")
+            print(f"       saved -> {path.name}")
 
     if save and metrics:
         meta = {
-            "trained_at":   datetime.now().isoformat(),
+            "trained_at": datetime.now().isoformat(),
             "feature_cols": feat_cols,
-            "horizons":     HORIZONS,
+            "horizons": HORIZONS,
             "lookback_years": lookback_years,
-            "metrics":      {str(k): v for k, v in metrics.items()},
+            "sample_step": sample_step,
+            "metrics": {str(k): v for k, v in metrics.items()},
         }
         (MODELS_DIR / "metadata.json").write_text(json.dumps(meta, indent=2))
-        print(f"\nMetadata saved → {MODELS_DIR / 'metadata.json'}")
+        print(f"\nMetadata saved -> {MODELS_DIR / 'metadata.json'}")
 
     return models
 
@@ -250,19 +272,30 @@ def main():
                         help="Years of historical data to use (default: 5)")
     parser.add_argument("--no-save",  action="store_true",
                         help="Train but don't save models to disk")
+    parser.add_argument(
+        "--sample-step",
+        type=int,
+        default=DEFAULT_SAMPLE_STEP,
+        help=f"Subsampling stride along the trading calendar (default: {DEFAULT_SAMPLE_STEP}; use 1 for densest data)",
+    )
     args = parser.parse_args()
 
     tickers = args.tickers or DEFAULT_TICKERS
-    print(f"Training on {len(tickers)} tickers, {args.lookback}Y lookback")
-    print(f"Output → {MODELS_DIR}\n")
+    print(f"Training on {len(tickers)} tickers, {args.lookback}Y lookback, sample_step={args.sample_step}")
+    print(f"Output -> {MODELS_DIR}\n")
 
-    models = train(tickers=tickers, lookback_years=args.lookback, save=not args.no_save)
+    models = train(
+        tickers=tickers,
+        lookback_years=args.lookback,
+        save=not args.no_save,
+        sample_step=args.sample_step,
+    )
 
     if models:
         print(f"\nDone. {len(models)} model(s) trained.")
         print("Run the dashboard to use them: streamlit run dashboard/app.py")
     else:
-        print("Training failed — check errors above.")
+        print("Training failed - check errors above.")
 
 
 if __name__ == "__main__":

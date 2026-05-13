@@ -413,10 +413,17 @@ def collect_data(ticker: str) -> dict:
         start_1y = end_dt - timedelta(days=400)
         start_5y = end_dt - timedelta(days=365 * 5 + 30)
 
+        hist_1y_raw = None
         try:
-            hist_1y = tk.history(start=start_1y.strftime("%Y-%m-%d"), interval="1d")
-            close_1y = hist_1y["Close"].dropna() if not hist_1y.empty else pd.Series(dtype=float)
+            hist_1y_raw = tk.history(start=start_1y.strftime("%Y-%m-%d"), interval="1d")
+            if hist_1y_raw is not None and not hist_1y_raw.empty:
+                hist_1y_raw = hist_1y_raw.sort_index()
+                close_1y = hist_1y_raw["Close"].dropna()
+            else:
+                close_1y = pd.Series(dtype=float)
+                hist_1y_raw = None
         except Exception:
+            hist_1y_raw = None
             close_1y = pd.Series(dtype=float)
 
         try:
@@ -425,7 +432,21 @@ def collect_data(ticker: str) -> dict:
         except Exception:
             close_5y = pd.Series(dtype=float)
 
-        result["close_1y"]   = close_1y.tolist() if not close_1y.empty else []
+        result["close_1y"] = close_1y.tolist() if not close_1y.empty else []
+        # OHLCV aligned to close_1y (for ML extended technical features)
+        if hist_1y_raw is not None and not close_1y.empty:
+            idx = close_1y.index
+            h = hist_1y_raw["High"].reindex(idx).astype(float)
+            l = hist_1y_raw["Low"].reindex(idx).astype(float)
+            v = hist_1y_raw["Volume"].reindex(idx).astype(float)
+            result["high_1y"] = h.fillna(close_1y).tolist()
+            result["low_1y"] = l.fillna(close_1y).tolist()
+            result["volume_1y"] = v.fillna(0.0).tolist()
+        else:
+            result["high_1y"] = []
+            result["low_1y"] = []
+            result["volume_1y"] = []
+
         result["close_5y_monthly"] = close_5y.tolist() if not close_5y.empty else []
 
         # Moving averages & RSI

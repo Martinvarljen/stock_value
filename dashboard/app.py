@@ -47,7 +47,13 @@ from momentum_engine import analyze_momentum
 
 from projection_engine import generate_projections
 from news_engine import analyze_news
-from ml_model.predictor import models_available, model_summary
+try:
+    from ml_model.predictor import models_available, model_summary, models_load_hint
+except ImportError:
+    from ml_model.predictor import models_available, model_summary
+
+    def models_load_hint() -> str:
+        return ""
 
 # ── page config ────────────────────────────────────────────────────────────────
 
@@ -104,9 +110,15 @@ with st.sidebar:
         with st.expander("Model info"):
             st.caption(model_summary())
     else:
-        st.warning("⚙️ No ML model — rule-based")
+        st.warning("No ML model — rule-based")
+        _hint = models_load_hint()
+        if _hint:
+            st.caption(_hint)
         with st.expander("Train ML model"):
-            st.code("python projection/ml_model/trainer.py", language="bash")
+            st.code(
+                "cd <Finance folder>\npython projection/ml_model/trainer.py",
+                language="bash",
+            )
 
     st.markdown("---")
     run_btn = st.button("🚀 Run Analysis", use_container_width=True, type="primary")

@@ -10,35 +10,61 @@ import math
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 MODELS_DIR = Path(__file__).parent / "saved_models"
 
-# Module-level cache — models loaded once per process
+# Module-level cache — reload when metadata on disk changes (e.g. after training)
 _cache: dict[int, object] = {}
 _meta: dict | None = None
-_loaded: bool = False
+_disk_mtime_loaded: float | None = None
+_last_load_error: str | None = None
 
 
 def _ensure_loaded() -> None:
-    global _cache, _meta, _loaded
-    if _loaded:
-        return
-    _loaded = True
+    """
+    Load or refresh models when metadata.json is new or cache is empty.
+
+    Streamlit keeps the process alive across reruns; a failed first load must
+    not permanently block later loads after `trainer.py` writes new files.
+    """
+    global _cache, _meta, _disk_mtime_loaded, _last_load_error
 
     meta_path = MODELS_DIR / "metadata.json"
     if not meta_path.exists():
+        _cache.clear()
+        _meta = None
+        _disk_mtime_loaded = None
+        _last_load_error = None
+        return
+
+    try:
+        mt = meta_path.stat().st_mtime
+    except OSError:
+        return
+
+    if _cache and _meta is not None and _disk_mtime_loaded == mt:
         return
 
     try:
         import joblib
+
         _meta = json.loads(meta_path.read_text())
+        new_cache: dict[int, object] = {}
         for h in _meta.get("horizons", []):
-            model_path = MODELS_DIR / f"lgbm_{h}d.pkl"
+            hi = int(h)
+            model_path = MODELS_DIR / f"lgbm_{hi}d.pkl"
             if model_path.exists():
-                _cache[h] = joblib.load(model_path)
+                new_cache[hi] = joblib.load(model_path)
+        _cache = new_cache
+        _disk_mtime_loaded = mt
+        _last_load_error = None if _cache else "metadata.json found but no matching .pkl files"
     except Exception as e:
-        print(f"  [predictor] Model load error: {e}")
+        _last_load_error = f"{type(e).__name__}: {e}"
+        print(f"  [predictor] Model load error: {_last_load_error}")
         _cache.clear()
+        _meta = None
+        _disk_mtime_loaded = None
 
 
 def ml_predict(features: dict, horizons: list[int] = None) -> dict[int, float] | None:
@@ -61,7 +87,8 @@ def ml_predict(features: dict, horizons: list[int] = None) -> dict[int, float] |
     if not feat_cols:
         return None
 
-    X = _build_vector(features, feat_cols)
+    row = _build_vector(features, feat_cols)
+    X = pd.DataFrame(row, columns=feat_cols)
 
     results: dict[int, float] = {}
     for h in targets:
@@ -89,6 +116,21 @@ def _build_vector(features: dict, feat_cols: list[str]) -> np.ndarray:
 def models_available() -> bool:
     _ensure_loaded()
     return bool(_cache)
+
+
+def models_load_hint() -> str:
+    """
+    Short message for UI when models are missing or failed to load.
+    Empty string if models are OK.
+    """
+    _ensure_loaded()
+    if _cache:
+        return ""
+    if not (MODELS_DIR / "metadata.json").exists():
+        return f"No trained models (expected under {MODELS_DIR})."
+    if _last_load_error:
+        return f"Load error: {_last_load_error}"
+    return "Models not loaded."
 
 
 def get_metadata() -> dict | None:
