@@ -1,0 +1,7 @@
+{
+  "best_val_mse": 0.0023843797822440576,
+  "n_windows": 89880,
+  "lookback": 40,
+  "horizon": 12,
+  "in_dim": 6
+}
