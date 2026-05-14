@@ -17,6 +17,12 @@ from red_flags             import analyze_red_flags,     print_red_flags
 from classification_engine import classify_stock,        print_classification
 from sector_engine         import apply_sector_context,  print_sector_context
 from momentum_engine       import analyze_momentum,      print_momentum
+from technical_extended    import analyze_extended_technicals
+from elliott_engine        import analyze_elliott_context
+from trade_setup_engine    import build_trade_setup
+from candle_patterns       import analyze_candle_patterns
+from ohlcv_validate        import validate_ohlcv_from_data_dict
+from market_structure      import analyze_market_structure
 from backtest_engine       import analyze_price_history, print_price_history
 from explanation_engine    import generate_explanation,  print_explanation
 from peer_engine           import analyze_peers,         print_peers
@@ -149,6 +155,12 @@ def analyze(tickers: list[str]) -> list[dict]:
         record["backtest_metrics"]   = backtest_result["backtest_metrics"]
         record["backtest_flags"]     = backtest_result["backtest_flags"]
 
+        record["extended_technicals"] = analyze_extended_technicals(data)
+        record["elliott_context"]     = analyze_elliott_context(data)
+        record["candle_patterns"]     = analyze_candle_patterns(data)
+        record["ohlcv_quality"]       = validate_ohlcv_from_data_dict(data)
+        record["market_structure"]    = analyze_market_structure(data)
+
         # Needed by classify_stock() sector growth sanity check (classification section 3b)
         record["sector_result"]      = sector_result
 
@@ -156,6 +168,7 @@ def analyze(tickers: list[str]) -> list[dict]:
         clf_result = classify_stock(record)
         record["classification_result"] = clf_result
         record["classification"]        = clf_result["classification"]
+        record["trade_setup"]             = build_trade_setup(record)
 
         # Narrative explanation (momentum_trend / momentum_metrics now in record)
         explanation_result = generate_explanation(record)
@@ -174,6 +187,15 @@ def analyze(tickers: list[str]) -> list[dict]:
         print_risk(risk_result, ticker)
         print_momentum(momentum_result, ticker)
         print_price_history(backtest_result, ticker)
+        ext = record.get("extended_technicals") or {}
+        tsm = ext.get("kaufman_tsm") or {}
+        if tsm.get("available"):
+            print(
+                f"  [Kaufman TSM-style] ER10={tsm['efficiency_ratio_10']:.3f}  "
+                f"mom10d_rel={tsm['momentum_10d_rel']:.4f}  "
+                f"reg20_1d_fcst={tsm['linreg_20d']['forecast_1d_return']:+.4f}  "
+                f"bias={tsm['combined_bias']:+.2f}"
+            )
         print_red_flags(red_flag_result, ticker)
         print_classification(clf_result, ticker)
 

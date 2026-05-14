@@ -1,0 +1,8 @@
+# Used when you run Streamlit from the Finance folder (or a parent that finds this file).
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true
+address = "127.0.0.1"
+port = 8501

@@ -1,16 +1,18 @@
 """
 trainer.py — Train LightGBM projection models on historical price data.
 
-Trains binary classifiers for P(up 20d), P(up 60d), P(up 120d).
-Uses extended OHLCV technical features (RSI, returns, vol, ATR, Bollinger %B,
-MACD vs price, MA spread, intraday range, volume).
+Trains binary classifiers for P(up 5d), P(up 20d), etc.
+Uses extended OHLCV technical features plus long-horizon / crisis-style proxies
+(drawdown, vol stress, panic days) and SPY-relative regime. Feature schema v3 — retrain after upgrading code.
 
 Run:
     cd Finance
     python projection/ml_model/trainer.py
     python projection/ml_model/trainer.py --tickers AAPL MSFT --lookback 8 --sample-step 1
+    python projection/ml_model/trainer.py --lookback 8 --sample-step 1 --deep
 
 Output:
+    projection/ml_model/saved_models/lgbm_5d.pkl
     projection/ml_model/saved_models/lgbm_20d.pkl
     projection/ml_model/saved_models/lgbm_60d.pkl
     projection/ml_model/saved_models/lgbm_120d.pkl
@@ -32,12 +34,17 @@ for _p in [str(_root / "stock_analyzer"), str(_root / "projection")]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from ml_model.features import TECH_FEATURES, extract_historical_features, MIN_OHLCV_BARS
+from ml_model.features import (
+    TECH_FEATURES,
+    FEATURE_SCHEMA_VERSION,
+    extract_historical_features,
+    MIN_OHLCV_BARS,
+)
 
 MODELS_DIR = Path(__file__).parent / "saved_models"
 MODELS_DIR.mkdir(exist_ok=True)
 
-HORIZONS = [20, 60, 120]
+HORIZONS = [5, 20, 60, 120]
 DEFAULT_SAMPLE_STEP = 3  # one row every N trading days (smaller = more data, slower)
 
 # Diversified large-cap training universe (deduped)
@@ -73,6 +80,27 @@ _DEFAULT_EXTRA = [
 DEFAULT_TICKERS = list(dict.fromkeys(_DEFAULT_CORE + _DEFAULT_EXTRA))
 
 
+def _fetch_spy_close(start_dt: datetime, end_dt: datetime) -> pd.Series | None:
+    """Daily SPY close aligned to training window (market regime / crisis context)."""
+    import yfinance as yf
+
+    try:
+        sh = yf.Ticker("SPY").history(
+            start=start_dt.strftime("%Y-%m-%d"),
+            end=end_dt.strftime("%Y-%m-%d"),
+            interval="1d",
+            auto_adjust=True,
+        )
+        if sh.empty or "Close" not in sh.columns:
+            return None
+        if sh.index.tz is not None:
+            sh = sh.copy()
+            sh.index = sh.index.tz_localize(None)
+        return sh["Close"].astype(float)
+    except Exception:
+        return None
+
+
 # ── data collection ────────────────────────────────────────────────────────────
 
 def collect_training_data(
@@ -90,6 +118,12 @@ def collect_training_data(
     start_dt = end_dt - timedelta(days=lookback_years * 365 + max(HORIZONS) + MIN_OHLCV_BARS + 30)
 
     all_rows: list[dict] = []
+
+    spy_series = _fetch_spy_close(start_dt, end_dt)
+    if spy_series is not None:
+        print(f"SPY regime series: {len(spy_series)} days", flush=True)
+    else:
+        print("SPY unavailable — spy regime features zeroed.", flush=True)
 
     for i, ticker in enumerate(tickers, 1):
         print(f"[{i:>3}/{len(tickers)}] {ticker:<8}", end=" ", flush=True)
@@ -117,7 +151,7 @@ def collect_training_data(
             added = 0
 
             for date in tradeable_dates:
-                feat = extract_historical_features(hist, date)
+                feat = extract_historical_features(hist, date, spy_series)
                 if feat is None:
                     continue
 
@@ -159,6 +193,7 @@ def train(
     lookback_years: int = 5,
     save: bool = True,
     sample_step: int = DEFAULT_SAMPLE_STEP,
+    deep: bool = False,
 ) -> dict:
     """
     Train LightGBM classifiers for each horizon.
@@ -181,27 +216,32 @@ def train(
         print("No training data available.")
         return {}
 
+    if deep:
+        print("Deep mode: stronger LightGBM (more trees, slower fit).")
+
     feat_cols = TECH_FEATURES   # only technical — available historically
     models    = {}
     metrics   = {}
 
     print("\nTraining models...")
 
-    for h in HORIZONS:
-        target_col = f"target_up_{h}d"
-        sub = df[feat_cols + [target_col]].dropna()
-
-        if len(sub) < 200:
-            print(f"  {h}d: skipped (only {len(sub)} samples)")
-            continue
-
-        X_df = sub[feat_cols]
-        y = sub[target_col].values.astype(int)
-
-        # Time-series CV
-        tscv = TimeSeriesSplit(n_splits=5)
-        cv_aucs = []
-
+    if deep:
+        lgbm_params = dict(
+            n_estimators=1400,
+            learning_rate=0.018,
+            max_depth=9,
+            num_leaves=96,
+            min_child_samples=40,
+            min_split_gain=0.002,
+            subsample=0.82,
+            colsample_bytree=0.82,
+            reg_alpha=0.08,
+            reg_lambda=0.12,
+            class_weight="balanced",
+            random_state=42,
+            verbose=-1,
+        )
+    else:
         lgbm_params = dict(
             n_estimators=800,
             learning_rate=0.025,
@@ -217,6 +257,21 @@ def train(
             random_state=42,
             verbose=-1,
         )
+
+    for h in HORIZONS:
+        target_col = f"target_up_{h}d"
+        sub = df[feat_cols + [target_col]].dropna()
+
+        if len(sub) < 200:
+            print(f"  {h}d: skipped (only {len(sub)} samples)")
+            continue
+
+        X_df = sub[feat_cols]
+        y = sub[target_col].values.astype(int)
+
+        # Time-series CV
+        tscv = TimeSeriesSplit(n_splits=5)
+        cv_aucs = []
 
         for train_idx, val_idx in tscv.split(X_df):
             m = lgb.LGBMClassifier(**lgbm_params)
@@ -251,9 +306,12 @@ def train(
         meta = {
             "trained_at": datetime.now().isoformat(),
             "feature_cols": feat_cols,
+            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            "n_tech_features": len(feat_cols),
             "horizons": HORIZONS,
             "lookback_years": lookback_years,
             "sample_step": sample_step,
+            "lgbm_deep": deep,
             "metrics": {str(k): v for k, v in metrics.items()},
         }
         (MODELS_DIR / "metadata.json").write_text(json.dumps(meta, indent=2))
@@ -278,10 +336,17 @@ def main():
         default=DEFAULT_SAMPLE_STEP,
         help=f"Subsampling stride along the trading calendar (default: {DEFAULT_SAMPLE_STEP}; use 1 for densest data)",
     )
+    parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="Stronger LightGBM (more trees, more regularization) — slower but often better fit",
+    )
     args = parser.parse_args()
 
     tickers = args.tickers or DEFAULT_TICKERS
     print(f"Training on {len(tickers)} tickers, {args.lookback}Y lookback, sample_step={args.sample_step}")
+    if args.deep:
+        print("  --deep enabled")
     print(f"Output -> {MODELS_DIR}\n")
 
     models = train(
@@ -289,6 +354,7 @@ def main():
         lookback_years=args.lookback,
         save=not args.no_save,
         sample_step=args.sample_step,
+        deep=args.deep,
     )
 
     if models:

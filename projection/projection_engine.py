@@ -2,8 +2,8 @@
 projection_engine.py — Forward projection & probability estimation
 
 generate_projections(record) → dict with:
-  - p_up_20d / p_up_60d / p_up_120d    probability price will be higher
-  - expected_return_20d / 60d / 120d    expected return over horizon
+  - p_up_5d / p_up_20d / p_up_60d / p_up_120d   probability price will be higher
+  - expected_return_5d / 20d / 60d / 120d       expected return over horizon
   - signal        BULLISH / LEAN_BULLISH / NEUTRAL / LEAN_BEARISH / BEARISH
   - confidence    HIGH / MEDIUM_HIGH / MEDIUM / LOW
   - paths         bull/base/bear projection paths (list of price points)
@@ -333,32 +333,39 @@ def generate_projections(record: dict, horizon_days: int = 120, news_result: dic
         news_result:  Output from news_engine.analyze_news() — optional.
     """
     score, sub_scores = _composite_score(record, news_result)
-    price = record.get("current_price")
+    price_raw = record.get("current_price")
     fair_value = record.get("fair_value_weighted")
 
-    if price is None or price <= 0:
+    try:
+        price = float(price_raw)
+    except (TypeError, ValueError):
+        return {"error": "No price data available"}
+    if math.isnan(price) or math.isinf(price) or price <= 0:
         return {"error": "No price data available"}
 
     beta = record.get("beta") or 1.0
     volatility = 0.20 * beta
 
     # Try ML model first; fall back to rule-based
-    ml_p20  = _ml_probability(record, 20)
-    ml_p60  = _ml_probability(record, 60)
+    ml_p5 = _ml_probability(record, 5)
+    ml_p20 = _ml_probability(record, 20)
+    ml_p60 = _ml_probability(record, 60)
     ml_p120 = _ml_probability(record, horizon_days)
-    ml_used = ml_p20 is not None
+    ml_used = any(x is not None for x in (ml_p5, ml_p20, ml_p60, ml_p120))
 
     def _blend(ml_p, rule_p, ml_weight=0.6):
         if ml_p is None:
             return rule_p
         return ml_weight * ml_p + (1 - ml_weight) * rule_p
 
-    p_up_20d  = _blend(ml_p20,  _rule_based_probability(score, 20))
-    p_up_60d  = _blend(ml_p60,  _rule_based_probability(score, 60))
+    p_up_5d = _blend(ml_p5, _rule_based_probability(score, 5))
+    p_up_20d = _blend(ml_p20, _rule_based_probability(score, 20))
+    p_up_60d = _blend(ml_p60, _rule_based_probability(score, 60))
     p_up_120d = _blend(ml_p120, _rule_based_probability(score, horizon_days))
 
-    er_20d  = _score_to_expected_return(score, 20)
-    er_60d  = _score_to_expected_return(score, 60)
+    er_5d = _score_to_expected_return(score, 5)
+    er_20d = _score_to_expected_return(score, 20)
+    er_60d = _score_to_expected_return(score, 60)
     er_120d = _score_to_expected_return(score, horizon_days)
 
     signal     = _classify_signal(score)
@@ -385,10 +392,12 @@ def generate_projections(record: dict, horizon_days: int = 120, news_result: dic
         "sub_scores":            {k: round(v, 3) for k, v in sub_scores.items()},
         "ml_used":               ml_used,
 
+        "p_up_5d":               round(p_up_5d, 3),
         "p_up_20d":              round(p_up_20d, 3),
         "p_up_60d":              round(p_up_60d, 3),
         "p_up_120d":             round(p_up_120d, 3),
 
+        "expected_return_5d":    round(er_5d, 4),
         "expected_return_20d":   round(er_20d, 4),
         "expected_return_60d":   round(er_60d, 4),
         "expected_return_120d":  round(er_120d, 4),
@@ -429,8 +438,8 @@ def print_projections(result: dict, ticker: str = ""):
     print(f"  Score:       {result['composite_score']:+.3f}")
     print(f"  ML model:    {'YES' if result['ml_used'] else 'no (rule-based fallback)'}")
     print()
-    print(f"  P(up)  20d: {result['p_up_20d']:.0%}   60d: {result['p_up_60d']:.0%}   {result['horizon_days']}d: {result['p_up_120d']:.0%}")
-    print(f"  ExpRet 20d: {result['expected_return_20d']:+.1%}   60d: {result['expected_return_60d']:+.1%}   {result['horizon_days']}d: {result['expected_return_120d']:+.1%}")
+    print(f"  P(up)   5d: {result['p_up_5d']:.0%}   20d: {result['p_up_20d']:.0%}   60d: {result['p_up_60d']:.0%}   {result['horizon_days']}d: {result['p_up_120d']:.0%}")
+    print(f"  ExpRet  5d: {result['expected_return_5d']:+.1%}   20d: {result['expected_return_20d']:+.1%}   60d: {result['expected_return_60d']:+.1%}   {result['horizon_days']}d: {result['expected_return_120d']:+.1%}")
 
     t = result["targets"]
     print(f"\n  Targets ({result['horizon_days']}d):  Bull {t['bull']:.2f}  Base {t['base']:.2f}  Bear {t['bear']:.2f}")

@@ -442,10 +442,13 @@ def collect_data(ticker: str) -> dict:
             result["high_1y"] = h.fillna(close_1y).tolist()
             result["low_1y"] = l.fillna(close_1y).tolist()
             result["volume_1y"] = v.fillna(0.0).tolist()
+            o = hist_1y_raw["Open"].reindex(idx).astype(float)
+            result["open_1y"] = o.fillna(close_1y).tolist()
         else:
             result["high_1y"] = []
             result["low_1y"] = []
             result["volume_1y"] = []
+            result["open_1y"] = []
 
         result["close_5y_monthly"] = close_5y.tolist() if not close_5y.empty else []
 

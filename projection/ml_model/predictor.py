@@ -151,4 +151,9 @@ def model_summary() -> str:
     auc_str = "  ".join(f"{k}: AUC {v}" for k, v in aucs.items())
     n = meta.get("metrics", {})
     n_samples = list(n.values())[0].get("n_samples", "?") if n else "?"
-    return f"LightGBM models trained {trained_at} | {n_samples:,} samples | {auc_str}"
+    n_tech = meta.get("n_tech_features", len(meta.get("feature_cols") or []))
+    schema = meta.get("feature_schema_version", "?")
+    return (
+        f"LightGBM trained {trained_at} | schema v{schema} | {n_tech} tech feats | "
+        f"{n_samples:,} samples | {auc_str}"
+    )

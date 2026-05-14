@@ -9,7 +9,7 @@ Two modes:
 import sys
 import math
 from pathlib import Path
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -24,6 +24,7 @@ for _p in [str(_root / "stock_analyzer"), str(_root / "projection")]:
 MIN_OHLCV_BARS = 220
 
 # Technical features (OHLCV-derived). Order is fixed for saved models / metadata.
+# v3 (2026): v2 + long-horizon returns, drawdown, vol stress, panic proxy, SPY-relative regime.
 TECH_FEATURES = [
     "rsi14",
     "price_vs_ma50",
@@ -33,6 +34,8 @@ TECH_FEATURES = [
     "return_1m",
     "return_3m",
     "return_6m",
+    "return_1y",
+    "return_2y",
     "volatility_20d",
     "vol_ratio_20_60",
     "volume_ratio",
@@ -41,7 +44,27 @@ TECH_FEATURES = [
     "macd_norm",
     "ma_spread_50_200",
     "hl_range_20d",
+    "dd_from_high_252d",
+    "vol_stress_vs_median",
+    "panic_day_ratio_20d",
+    "rel_ret_63_vs_spy",
+    "spy_dd_126d",
+    # Kaufman *Trading Systems & Methods*
+    "tsm_er10",
+    "tsm_er20",
+    "tsm_mom10_rel",
+    "tsm_reg20_slope_norm",
+    "tsm_reg20_fcst1d",
+    "tsm_reg20_r2",
+    "tsm_bias",
 ]
+
+FEATURE_SCHEMA_VERSION = 3
+
+try:
+    from kaufman_tsm import compute_kaufman_tsm as _compute_kaufman_tsm
+except ImportError:
+    _compute_kaufman_tsm = None  # type: ignore[misc, assignment]
 
 # Full feature set (used for live inference)
 ALL_FEATURES = TECH_FEATURES + [
@@ -57,6 +80,40 @@ ALL_FEATURES = TECH_FEATURES + [
     "n_critical_flags",
     "composite_score",
 ]
+
+
+_SPY_LIVE_CACHE: pd.Series | None = None
+_SPY_LIVE_CACHE_DATE: date | None = None
+
+
+def _get_live_spy_close_series() -> pd.Series | None:
+    """One SPY download per calendar day (live dashboard / inference)."""
+    global _SPY_LIVE_CACHE, _SPY_LIVE_CACHE_DATE
+    today = date.today()
+    if _SPY_LIVE_CACHE is not None and _SPY_LIVE_CACHE_DATE == today:
+        return _SPY_LIVE_CACHE
+    try:
+        import yfinance as yf
+
+        end = datetime.now()
+        start = end - timedelta(days=900)
+        sh = yf.Ticker("SPY").history(
+            start=start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+            interval="1d",
+            auto_adjust=True,
+        )
+        if sh.empty or "Close" not in sh.columns:
+            return None
+        if sh.index.tz is not None:
+            sh = sh.copy()
+            sh.index = sh.index.tz_localize(None)
+        s = sh["Close"].astype(float)
+        _SPY_LIVE_CACHE = s
+        _SPY_LIVE_CACHE_DATE = today
+        return s
+    except Exception:
+        return None
 
 
 # ── live feature extraction ────────────────────────────────────────────────────
@@ -85,6 +142,13 @@ def extract_features(record: dict) -> dict:
         tech = _tech_fallback_from_record(record, price)
 
     feat.update(tech)
+
+    if tech is not None and n >= MIN_OHLCV_BARS:
+        idx = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=n, freq="B")
+        cser = pd.Series(close_l, index=idx, dtype=float)
+        spy_live = _get_live_spy_close_series()
+        if spy_live is not None:
+            _apply_spy_regime_features(feat, cser, spy_live, idx[-1].to_pydatetime())
 
     # Valuation
     fv = record.get("fair_value_weighted")
@@ -144,15 +208,37 @@ def _tech_fallback_from_record(record: dict, price: float) -> dict[str, float]:
     else:
         feat["ma_spread_50_200"] = 0.0
     feat["hl_range_20d"] = feat["volatility_20d"] / math.sqrt(252) if feat["volatility_20d"] else 0.02
+    feat["return_1y"] = feat["return_6m"]
+    feat["return_2y"] = feat["return_1y"]
+    feat["dd_from_high_252d"] = 0.0
+    feat["vol_stress_vs_median"] = 1.0
+    feat["panic_day_ratio_20d"] = 0.0
+    feat["rel_ret_63_vs_spy"] = 0.0
+    feat["spy_dd_126d"] = 0.0
+    for _k in (
+        "tsm_er10",
+        "tsm_er20",
+        "tsm_mom10_rel",
+        "tsm_reg20_slope_norm",
+        "tsm_reg20_fcst1d",
+        "tsm_reg20_r2",
+        "tsm_bias",
+    ):
+        feat[_k] = 0.0
     return feat
 
 
 # ── historical feature extraction (for training) ──────────────────────────────
 
-def extract_historical_features(history: pd.DataFrame, date: datetime) -> dict | None:
+def extract_historical_features(
+    history: pd.DataFrame,
+    date: datetime,
+    spy_close: pd.Series | None = None,
+) -> dict | None:
     """
     Extract TECH_FEATURES from historical OHLCV at a given date.
-    Fundamental features are NaN (imputed as dataset medians if ever used).
+    Optional spy_close (aligned daily Close) adds market-relative regime columns.
+    Fundamental columns in ALL_FEATURES stay NaN for training rows (imputed if used).
     """
     hist = history[history.index <= pd.Timestamp(date)]
     if len(hist) < MIN_OHLCV_BARS:
@@ -169,6 +255,8 @@ def extract_historical_features(history: pd.DataFrame, date: datetime) -> dict |
     feat = technical_features_from_ohlcv(sub)
     if feat is None:
         return None
+
+    _apply_spy_regime_features(feat, sub["Close"].astype(float), spy_close, date)
 
     for col in ALL_FEATURES:
         if col not in feat:
@@ -206,6 +294,15 @@ def technical_features_from_ohlcv(hist: pd.DataFrame) -> dict[str, float] | None
     feat["return_6m"] = _safe_return(close, 126)
 
     rets = close.pct_change().dropna()
+    if len(close) >= 253:
+        feat["return_1y"] = _safe_return(close, 252)
+    else:
+        feat["return_1y"] = feat["return_6m"]
+    if len(close) >= 505:
+        feat["return_2y"] = _safe_return(close, 504)
+    else:
+        feat["return_2y"] = feat["return_1y"]
+
     if len(rets) >= 20:
         v20 = float(rets.iloc[-20:].std() * math.sqrt(252))
     else:
@@ -231,7 +328,110 @@ def technical_features_from_ohlcv(hist: pd.DataFrame) -> dict[str, float] | None
     hl = ((high.iloc[-20:] - low.iloc[-20:]) / close.iloc[-20:]).mean()
     feat["hl_range_20d"] = float(hl) if not (isinstance(hl, float) and math.isnan(hl)) else 0.0
 
+    _apply_long_horizon_stress(feat, close, high, low, rets)
+    _apply_tsm_ml_features(feat, close, high, low)
+
     return feat
+
+
+def _apply_long_horizon_stress(
+    feat: dict[str, float],
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    rets: pd.Series,
+) -> None:
+    """Drawdown, vol stress, panic proxy — captures crisis-style stretches (price-only)."""
+    lc = len(close)
+    if lc >= 252:
+        rm = float(close.rolling(252).max().iloc[-1])
+        c0 = float(close.iloc[-1])
+        feat["dd_from_high_252d"] = float(max(-1.0, min(0.0, c0 / rm - 1.0))) if rm > 0 else 0.0
+    else:
+        feat["dd_from_high_252d"] = 0.0
+
+    if len(rets) >= 252:
+        rv = rets.rolling(20).std()
+        cur = float(rv.iloc[-1])
+        med = float(rv.iloc[-252:].median())
+        feat["vol_stress_vs_median"] = float(min(4.0, max(0.25, cur / (med + 1e-12))))
+    else:
+        feat["vol_stress_vs_median"] = 1.0
+
+    if lc >= 22:
+        rng = (high - low).iloc[-20:]
+        red = close.iloc[-20:] < close.shift(1).iloc[-20:]
+        med_r = float(rng.median())
+        if med_r > 1e-12 and not math.isnan(med_r):
+            panic = float(((rng > med_r * 1.5) & red.fillna(False)).sum()) / 20.0
+            feat["panic_day_ratio_20d"] = min(1.0, panic)
+        else:
+            feat["panic_day_ratio_20d"] = 0.0
+    else:
+        feat["panic_day_ratio_20d"] = 0.0
+
+
+def _apply_spy_regime_features(
+    feat: dict[str, float],
+    stock_close: pd.Series,
+    spy_close: pd.Series | None,
+    date: datetime,
+) -> None:
+    """Relative strength vs SPY + SPY drawdown (shared market stress / crisis proxy)."""
+    if spy_close is None or spy_close.empty:
+        feat["rel_ret_63_vs_spy"] = 0.0
+        feat["spy_dd_126d"] = 0.0
+        return
+    try:
+        ts = pd.Timestamp(date)
+        spy = spy_close[spy_close.index <= ts].dropna().astype(float)
+        stk = stock_close[stock_close.index <= ts].dropna().astype(float)
+        if len(spy) < 70 or len(stk) < 70:
+            feat["rel_ret_63_vs_spy"] = 0.0
+            feat["spy_dd_126d"] = 0.0
+            return
+        sr = float(stk.iloc[-1] / stk.iloc[-64] - 1.0) if len(stk) >= 64 else 0.0
+        pr = float(spy.iloc[-1] / spy.iloc[-64] - 1.0) if len(spy) >= 64 else 0.0
+        feat["rel_ret_63_vs_spy"] = float(max(-0.6, min(0.6, sr - pr)))
+        mx = float(spy.iloc[-126:].max())
+        lc = float(spy.iloc[-1])
+        feat["spy_dd_126d"] = float(max(-0.75, min(0.0, lc / mx - 1.0))) if mx > 0 else 0.0
+    except Exception:
+        feat["rel_ret_63_vs_spy"] = 0.0
+        feat["spy_dd_126d"] = 0.0
+
+
+def _apply_tsm_ml_features(
+    feat: dict[str, float],
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+) -> None:
+    """Populate TSM / Kaufman columns into feat dict (mutates feat)."""
+    defaults = {
+        "tsm_er10": 0.0,
+        "tsm_er20": 0.0,
+        "tsm_mom10_rel": 0.0,
+        "tsm_reg20_slope_norm": 0.0,
+        "tsm_reg20_fcst1d": 0.0,
+        "tsm_reg20_r2": 0.0,
+        "tsm_bias": 0.0,
+    }
+    if _compute_kaufman_tsm is None:
+        feat.update(defaults)
+        return
+    tsm = _compute_kaufman_tsm(close, high, low)
+    if not tsm.get("available"):
+        feat.update(defaults)
+        return
+    lr = tsm.get("linreg_20d") or {}
+    feat["tsm_er10"] = float(tsm.get("efficiency_ratio_10") or 0.0)
+    feat["tsm_er20"] = float(tsm.get("efficiency_ratio_20") or 0.0)
+    feat["tsm_mom10_rel"] = float(tsm.get("momentum_10d_rel") or 0.0)
+    feat["tsm_reg20_slope_norm"] = float(lr.get("slope_norm") or 0.0)
+    feat["tsm_reg20_fcst1d"] = float(lr.get("forecast_1d_return") or 0.0)
+    feat["tsm_reg20_r2"] = float(lr.get("r2") or 0.0)
+    feat["tsm_bias"] = float(tsm.get("combined_bias") or 0.0)
 
 
 def feature_vector(feat: dict, feature_names: list[str]) -> np.ndarray:
