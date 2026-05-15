@@ -119,13 +119,14 @@ def _get_live_spy_close_series() -> pd.Series | None:
 # ── live feature extraction ────────────────────────────────────────────────────
 
 def extract_features(record: dict) -> dict:
-    """Extract ML features from a live stock record dict."""
+    """Extract ML features from a stock record dict (live or backtest checkpoint)."""
     price = record.get("current_price") or 0.0
 
     feat: dict[str, float] = {}
 
     close_l = record.get("close_1y") or []
     n = len(close_l)
+    as_of = record.get("feature_as_of") or record.get("checkpoint_date")
     high_l = record.get("high_1y") or []
     low_l = record.get("low_1y") or []
     vol_l = record.get("volume_1y") or []
@@ -144,11 +145,14 @@ def extract_features(record: dict) -> dict:
     feat.update(tech)
 
     if tech is not None and n >= MIN_OHLCV_BARS:
-        idx = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=n, freq="B")
+        end_ts = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.now().normalize()
+        idx = pd.bdate_range(end=end_ts.normalize(), periods=n, freq="B")
         cser = pd.Series(close_l, index=idx, dtype=float)
-        spy_live = _get_live_spy_close_series()
-        if spy_live is not None:
-            _apply_spy_regime_features(feat, cser, spy_live, idx[-1].to_pydatetime())
+        spy_ser = record.get("spy_close_series")
+        if spy_ser is None or (hasattr(spy_ser, "empty") and spy_ser.empty):
+            spy_ser = _get_live_spy_close_series()
+        if spy_ser is not None and len(spy_ser):
+            _apply_spy_regime_features(feat, cser, spy_ser, idx[-1].to_pydatetime())
 
     # Valuation
     fv = record.get("fair_value_weighted")

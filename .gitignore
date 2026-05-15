@@ -24,3 +24,6 @@ projection/ml_model/saved_models/training_log*.txt
 
 Thumbs.db
 Desktop.ini
+
+# Paper agent runtime (config.json is tracked)
+portfolio/data/

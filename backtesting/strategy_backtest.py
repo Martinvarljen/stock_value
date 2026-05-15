@@ -34,8 +34,10 @@ Yearly top-100 universe (lagged one calendar year, no look-ahead), checkpoints f
     python backtesting/strategy_backtest.py --yearly-top100
     python backtesting/strategy_backtest.py --yearly-top100 --checkpoint-freq M
     # Month-end checkpoints (~3x more evaluation dates than quarters).
+    python backtesting/strategy_backtest.py --yearly-top100 --strategy ml
+    # ML projection strategy: technicals + Dolt-trained LightGBM (projection_engine, no DCF).
     python backtesting/strategy_backtest.py --yearly-top100 --signal-tech-ai
-    # BUY tiers from momentum/technicals + projection_engine (no DCF in composite).
+    # Same as --strategy ml (legacy flag).
 
     Each checkpoint in year C only evaluates names in the top-100 list for year C-1
     (built from prior-year dollar volume among current S&P 500 — see yearly_top100_universe.py).
@@ -64,6 +66,17 @@ from quality_engine import analyze_quality
 from backtesting.yearly_top100_universe import (
     default_universe_cache_dir,
     load_universe_map_for_lag_years,
+)
+from backtesting.strategy_modes import (
+    MODE_DCF,
+    is_ml_strategy,
+    normalize_signal_mode,
+    strategy_display_name,
+)
+from backtesting.ml_quant import (
+    aggregate_quintile_forward_returns,
+    ml_score_from_signal,
+    print_quintile_table,
 )
 from financial_strength import analyze_financials
 from valuation_engine import analyze_valuation
@@ -391,6 +404,32 @@ def collect_raw_yfinance(ticker: str) -> dict:
         "cash_flow": cf_a,
         "price_history": hist,
     }
+
+
+def reconstruct_price_only_at(raw: dict, as_of_date: datetime) -> dict | None:
+    """
+    Minimal point-in-time record for ML scoring when yfinance fundamentals
+    are too sparse (common before ~2020 on ``income_statement``).
+    """
+    ticker = raw.get("ticker", "")
+    price = _get_price_at(raw.get("price_history"), as_of_date)
+    if price is None or price <= 0:
+        return None
+
+    info = raw.get("info") or {}
+    result = {
+        "ticker": ticker,
+        "error": None,
+        "current_price": price,
+        "beta": _safe(info.get("beta")),
+        "feature_as_of": as_of_date,
+        "checkpoint_date": as_of_date,
+    }
+    enrich_point_in_time_technicals(result, raw, as_of_date)
+    # ml_model.features.MIN_OHLCV_BARS
+    if len(result.get("close_1y") or []) < 220:
+        return None
+    return result
 
 
 def reconstruct_data_at(raw: dict, as_of_date: datetime) -> dict | None:
@@ -741,12 +780,22 @@ def projection_signal_to_classification(sig: str) -> str:
     }.get(sig or "", "HOLD")
 
 
-def infer_classification_tech_ai(data: dict, raw: dict, as_of: datetime) -> tuple[str | None, dict]:
+def infer_classification_tech_ai(
+    data: dict,
+    raw: dict,
+    as_of: datetime,
+    *,
+    spy_close_series: pd.Series | None = None,
+) -> tuple[str | None, dict]:
     """
     Technicals + fundamentals (no DCF) + projection_engine (ML blend when available).
     Maps projection ``signal`` onto the same tier labels used by the DCF classifier.
     """
-    meta: dict = {"signal_mode": "tech_ai"}
+    meta: dict = {"signal_mode": "tech_ai", "strategy": "ml"}
+    data["feature_as_of"] = as_of
+    data["checkpoint_date"] = as_of
+    if spy_close_series is not None and len(spy_close_series):
+        data["spy_close_series"] = spy_close_series
     enrich_point_in_time_technicals(data, raw, as_of)
 
     sector_result = apply_sector_context(data)
@@ -785,6 +834,12 @@ def infer_classification_tech_ai(data: dict, raw: dict, as_of: datetime) -> tupl
     meta["projection_signal"] = sig
     meta["composite_score"] = proj.get("composite_score")
     meta["confidence"] = proj.get("confidence")
+    meta["ml_used"] = bool(proj.get("ml_used"))
+    meta["p_up_5d"] = proj.get("p_up_5d")
+    meta["p_up_20d"] = proj.get("p_up_20d")
+    meta["p_up_60d"] = proj.get("p_up_60d")
+    meta["p_up_120d"] = proj.get("p_up_120d")
+    meta["ml_blend_weight"] = proj.get("ml_blend_weight_used")
     return projection_signal_to_classification(sig), meta
 
 
@@ -798,6 +853,7 @@ def classify_at(
     use_valuation: bool = True,
     signal_mode: str = "dcf",
     signal_meta: dict | None = None,
+    spy_close_series: pd.Series | None = None,
 ) -> str | None:
     """Run the full engine pipeline on reconstructed data and return classification.
 
@@ -808,10 +864,13 @@ def classify_at(
         tier is derived from projection ``signal`` (BULLISH -> STRONG BUY, etc.).
         Requires ``raw`` (yfinance bundle) and ``cp_date`` (checkpoint).
     """
+    signal_mode = normalize_signal_mode(signal_mode)
     if signal_mode == "tech_ai":
         if raw is None or cp_date is None:
             return None
-        cl, meta = infer_classification_tech_ai({**data}, raw, cp_date)
+        cl, meta = infer_classification_tech_ai(
+            {**data}, raw, cp_date, spy_close_series=spy_close_series
+        )
         if signal_meta is not None:
             signal_meta.update(meta)
         return cl
@@ -947,6 +1006,7 @@ def run_backtest(
     signal_mode: str = "dcf",
     checkpoint_freq: str | None = None,
 ) -> dict:
+    signal_mode = normalize_signal_mode(signal_mode)
     """
     Run the full strategy backtest.
 
@@ -1034,17 +1094,21 @@ def run_backtest(
         print(f"  Benchmark:    {bench_label} (excess = stock fwd − benchmark fwd)")
     else:
         print(f"  Benchmark:    (none)")
-    if signal_mode == "tech_ai":
-        print(f"  Valuation:    N/A (signal from technicals + projection_engine, no DCF)")
+    signal_mode = normalize_signal_mode(signal_mode)
+    if is_ml_strategy(signal_mode):
+        print(f"  Valuation:    N/A (ML projection strategy, no DCF in composite)")
+        print(f"  Signal mode:  {strategy_display_name(signal_mode)}")
     else:
         print(f"  Valuation:    {'DCF / valuation_engine ON' if use_valuation else 'OFF (quality / financials / risk / sector only)'}")
-    if signal_mode == "tech_ai":
-        print(f"  Signal mode:  tech_ai (technicals + projection_engine, no DCF in composite)")
-    else:
-        print(f"  Signal mode:  dcf (classification_engine)")
+        print(f"  Signal mode:  {strategy_display_name(signal_mode)}")
     print(f"{'═' * 70}\n")
 
     signals = []
+    spy_feat: pd.Series | None = None
+    if bench_hist is not None and "Close" in bench_hist.columns:
+        spy_feat = bench_hist["Close"].astype(float).copy()
+        if getattr(spy_feat.index, "tz", None) is not None:
+            spy_feat.index = spy_feat.index.tz_localize(None)
 
     for i, ticker in enumerate(all_tickers, 1):
         print(f"  [{i}/{len(all_tickers)}] {ticker} ... ", end="", flush=True)
@@ -1078,7 +1142,8 @@ def run_backtest(
                 cp_date,
                 use_valuation=use_valuation,
                 signal_mode=signal_mode,
-                signal_meta=sig_meta if signal_mode == "tech_ai" else None,
+                signal_meta=sig_meta if is_ml_strategy(signal_mode) else None,
+                spy_close_series=spy_feat,
             )
             if classification is None:
                 continue
@@ -1102,11 +1167,15 @@ def run_backtest(
             }
             if yearly_top100:
                 row["universe_lag_year"] = cp_date.year - 1
-            if signal_mode == "tech_ai":
-                row["signal_mode"] = "tech_ai"
+            if is_ml_strategy(signal_mode):
+                row["signal_mode"] = "ml"
                 row["projection_signal"] = sig_meta.get("projection_signal")
                 row["composite_score"] = sig_meta.get("composite_score")
                 row["confidence"] = sig_meta.get("confidence")
+                row["ml_used"] = sig_meta.get("ml_used")
+                row["p_up_20d"] = sig_meta.get("p_up_20d")
+                row["p_up_60d"] = sig_meta.get("p_up_60d")
+                row["ml_score"] = ml_score_from_signal({**row, **sig_meta})
 
             if bench_hist is not None:
                 spy_px = _get_price_at(bench_hist, cp_date)
@@ -1138,10 +1207,15 @@ def run_backtest(
     if universe_by_lag_year is not None:
         uni_counts = {y: len(v) for y, v in sorted(universe_by_lag_year.items())}
 
+    ml_quintiles = None
+    if is_ml_strategy(signal_mode):
+        ml_quintiles = aggregate_quintile_forward_returns(signals, horizon_months=6)
+
     return {
         "signals": signals,
         "by_tier": by_tier,
         "summary": summary,
+        "ml_quintiles": ml_quintiles,
         "checkpoints": checkpoints,
         "tickers": all_tickers,
         "benchmark": bench_label,
@@ -1150,7 +1224,7 @@ def run_backtest(
         "universe_map": universe_by_lag_year if yearly_top100 else None,
         "universe_cache_dir": str(udir),
         "use_valuation": use_valuation,
-        "signal_mode": signal_mode,
+        "signal_mode": "ml" if is_ml_strategy(signal_mode) else MODE_DCF,
         "checkpoint_freq": cf,
     }
 
@@ -1299,11 +1373,11 @@ def print_backtest_results(results: dict):
     print(f"\n{'═' * 70}")
     print(f"  BACKTEST RESULTS")
     print(f"{'═' * 70}")
-    if results.get("signal_mode") == "tech_ai":
-        print("  Signal mode:  tech_ai (projection signal mapped to tiers; no DCF classifier)")
+    if is_ml_strategy(results.get("signal_mode")):
+        print(f"  Signal mode:  {strategy_display_name(results.get('signal_mode'))}")
     if results.get("checkpoint_freq") == "M":
         print("  Checkpoints:  month-end (multiple evaluations per year per ticker)")
-    if not results.get("use_valuation", True) and results.get("signal_mode") != "tech_ai":
+    if not results.get("use_valuation", True) and not is_ml_strategy(results.get("signal_mode")):
         print("  Valuation:    OFF (no DCF / valuation_engine in classifications)")
     print(f"  Total signals: {summary['total_signals']}  "
           f"({summary.get('unique_tickers', 0)} tickers × multiple checkpoints)")
@@ -1386,6 +1460,12 @@ def print_backtest_results(results: dict):
                   f"Review classification thresholds or check for value-trap bias.")
     else:
         print(f"\n  VERDICT: Insufficient BUY/AVOID signals to compute spread.")
+
+    if is_ml_strategy(results.get("signal_mode")) and results.get("ml_quintiles"):
+        print_quintile_table(results["ml_quintiles"], horizon_months=6)
+        print(
+            "  Tip: if Q5−Q1 is positive, use market_neutral_backtest.py (long top / short bottom by score)."
+        )
 
     if results.get("benchmark") and summary.get("avg_buy_excess_6m") is not None:
         b = results["benchmark"]
@@ -1488,7 +1568,10 @@ def export_to_excel(results: dict, filepath: str | None = None) -> str:
     headers2 = ["Ticker", "Date", "Classification"]
     if has_univ:
         headers2.append("Univ lag Yr")
+    has_ml = any(s.get("p_up_20d") is not None for s in results["signals"])
     headers2 += ["Price", "Fwd 3M", "Fwd 6M", "Fwd 12M"]
+    if has_ml:
+        headers2 += ["Proj signal", "P(up) 20d", "P(up) 60d", "ML used"]
     if bench:
         headers2 += ["Spy Fwd 3M", "Spy Fwd 6M", "Spy Fwd 12M", "Excess 3M", "Excess 6M", "Excess 12M"]
     for col, h in enumerate(headers2, 1):
@@ -1517,6 +1600,18 @@ def export_to_excel(results: dict, filepath: str | None = None) -> str:
         ws2.cell(row=row_idx, column=col, value=s.get("fwd_12m"))
         col += 1
         pct_cols = [c_fwd3, c_fwd6, c_fwd12]
+        if has_ml:
+            ws2.cell(row=row_idx, column=col, value=s.get("projection_signal"))
+            col += 1
+            c_p20 = col
+            ws2.cell(row=row_idx, column=col, value=s.get("p_up_20d"))
+            col += 1
+            c_p60 = col
+            ws2.cell(row=row_idx, column=col, value=s.get("p_up_60d"))
+            col += 1
+            ws2.cell(row=row_idx, column=col, value=s.get("ml_used"))
+            col += 1
+            pct_cols.extend([c_p20, c_p60])
         if bench:
             c0 = col
             ws2.cell(row=row_idx, column=col, value=s.get("spy_fwd_3m"))
@@ -1711,6 +1806,7 @@ def main():
     use_valuation = True
     signal_mode = "dcf"
     checkpoint_freq: str | None = None
+    run_market_neutral_flag = False
 
     args = sys.argv[1:]
     i = 0
@@ -1752,7 +1848,13 @@ def main():
             use_valuation = False
             i += 1
         elif a == "--signal-tech-ai":
-            signal_mode = "tech_ai"
+            signal_mode = "ml"
+            i += 1
+        elif a == "--strategy" and i + 1 < len(args):
+            signal_mode = args[i + 1]
+            i += 2
+        elif a == "--market-neutral":
+            run_market_neutral_flag = True
             i += 1
         elif a == "--checkpoint-freq" and i + 1 < len(args):
             checkpoint_freq = args[i + 1]
@@ -1815,6 +1917,8 @@ def main():
     if yearly_top100 and checkpoint_min_year is None:
         checkpoint_min_year = DEFAULT_TOP100_CHECKPOINT_MIN_YEAR
 
+    signal_mode = normalize_signal_mode(signal_mode)
+
     print(f"\nStrategy Backtest — {datetime.today().strftime('%Y-%m-%d')}")
 
     try:
@@ -1852,7 +1956,8 @@ def main():
         try:
             from backtesting.dynamic_portfolio_backtest import run_dynamic
 
-            dyn_path = _ROOT / f"strategy_dynamic_vs_spy_{datetime.today().strftime('%Y%m%d')}.html"
+            dyn_suffix = "ml" if is_ml_strategy(results.get("signal_mode")) else "dcf"
+            dyn_path = _ROOT / f"strategy_dynamic_{dyn_suffix}_vs_spy_{datetime.today().strftime('%Y%m%d')}.html"
             run_dynamic(
                 lookback_years=lookback,
                 checkpoint_min_year=checkpoint_min_year,
@@ -1871,11 +1976,23 @@ def main():
                 use_valuation=use_valuation,
                 signal_mode=results.get("signal_mode", "dcf"),
                 checkpoint_freq=results.get("checkpoint_freq", "Q"),
+                min_p_up_20d=0.52 if is_ml_strategy(results.get("signal_mode")) else None,
+                regime_filter=is_ml_strategy(results.get("signal_mode")),
+                entry_mode="rank" if is_ml_strategy(results.get("signal_mode")) else "tier",
             )
             print(f"\n  Dynamic strategy vs SPY buy-and-hold (animated monthly) -> {dyn_path}")
             print("     Use the slider / Play control to step through months.")
         except Exception as e:
             print(f"\n  Dynamic HTML export failed: {e}")
+
+    if run_market_neutral_flag and is_ml_strategy(results.get("signal_mode")):
+        try:
+            from backtesting.market_neutral_backtest import run_market_neutral_from_results
+
+            mn = run_market_neutral_from_results(results)
+            print(f"  Market-neutral L/S chart -> {mn['html']}")
+        except Exception as e:
+            print(f"\n  Market-neutral backtest failed: {e}")
 
     if bm_arg and legacy_html:
         try:

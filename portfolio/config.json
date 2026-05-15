@@ -1,0 +1,23 @@
+{
+  "paper_nav": 1.0,
+  "position_frac": 0.1,
+  "max_positions": 10,
+  "max_new_entries_per_day": 3,
+  "min_p_up_long": 0.58,
+  "max_p_up_short": 0.42,
+  "exit_p_up_long": 0.36,
+  "exit_p_up_short": 0.55,
+  "long_quintile_min": 4,
+  "short_quintile_max": 2,
+  "enable_short": true,
+  "stop_loss_pct": 0.2,
+  "take_profit_pct": 0.35,
+  "max_hold_days": 50,
+  "estimated_hold_days": 30,
+  "regime_filter": true,
+  "bear_scale": 0.35,
+  "universe": "top100",
+  "margin_of_safety": 0.3,
+  "include_news": false,
+  "news_days": 3
+}

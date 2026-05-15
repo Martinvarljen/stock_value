@@ -22,7 +22,8 @@ Requires yearly top-100 cache files (same as strategy_backtest). Example:
 
     python backtesting/build_yearly_top100_universe.py --for-checkpoints-from-year 2023
     python backtesting/dynamic_portfolio_backtest.py
-    python backtesting/dynamic_portfolio_backtest.py --signal-tech-ai
+    python backtesting/dynamic_portfolio_backtest.py --strategy ml
+    python backtesting/run_ml_backtest.ps1
     # (defaults: checkpoints from 2023 onward vs SPY buy-and-hold; use --checkpoint-min-year 0 for no year filter)
 """
 
@@ -43,7 +44,12 @@ if str(_ROOT) not in sys.path:
 sys.path.insert(0, str(_ROOT / "stock_analyzer"))
 
 import backtesting.strategy_backtest as st
+from backtesting.regime import gross_exposure_scale, spy_close_series
+from backtesting.strategy_modes import is_ml_strategy, normalize_signal_mode, strategy_display_name
 from backtesting.yearly_top100_universe import default_universe_cache_dir, load_universe_map_for_lag_years
+
+# (checkpoint_day, classification, optional p_up_20d for ML gate)
+CheckpointSignal = tuple[datetime, str | None, float | None]
 
 
 @dataclass
@@ -74,14 +80,16 @@ def _prep_price_df(hist: pd.DataFrame) -> pd.DataFrame | None:
     return df
 
 
-def _last_class_on_or_before(rows: list[tuple[datetime, str | None]], d: datetime) -> str | None:
-    best: str | None = None
-    for cp, cl in rows:
+def _last_signal_on_or_before(rows: list[CheckpointSignal], d: datetime) -> tuple[str | None, float | None]:
+    best_cl: str | None = None
+    best_p: float | None = None
+    for cp, cl, p_up in rows:
         if cp <= d:
-            best = cl
+            best_cl = cl
+            best_p = p_up
         else:
             break
-    return best
+    return best_cl, best_p
 
 
 def _row_asof(df: pd.DataFrame, d: datetime) -> pd.Series | None:
@@ -175,7 +183,13 @@ def run_dynamic(
     use_valuation: bool = True,
     signal_mode: str = "dcf",
     checkpoint_freq: str | None = None,
+    min_p_up_20d: float | None = None,
+    regime_filter: bool = False,
+    bear_scale: float = 0.35,
+    entry_mode: str = "tier",
 ) -> Path:
+    signal_mode = normalize_signal_mode(signal_mode)
+    entry_mode = entry_mode.strip().lower()
     look = lookback_years
     if checkpoint_min_year is not None:
         y_now = datetime.today().year
@@ -223,16 +237,33 @@ def run_dynamic(
         f"\nDynamic portfolio - {len(tickers_list)} tickers, {len(checkpoints)} checkpoints "
         f"({'month-end' if cf == 'M' else 'quarter-end'}) {checkpoints[0].date()} -> {checkpoints[-1].date()}"
     )
+    ml_note = ""
+    if is_ml_strategy(signal_mode):
+        ml_note = f" Signals: {strategy_display_name(signal_mode)}."
+        if min_p_up_20d is not None:
+            ml_note += f" Entry requires P(up) 20d >= {min_p_up_20d:.0%}."
     print(
         f"Rules: BUY tiers only, {breakout_days}d high breakout, "
         f"stop {stop_loss:.0%}, TP {take_profit:.0%}, max hold {max_hold_days}d, "
         f"{position_frac:.0%} NAV/trade, max {max_positions} positions."
-        + ("" if use_valuation else " Valuation engine OFF.")
+        + ("" if use_valuation or is_ml_strategy(signal_mode) else " Valuation engine OFF.")
+        + ml_note
         + "\n"
     )
 
+    spy_feat = spy_df["Close"].astype(float)
+
+    def _eligible(cls: str | None, p_up: float | None, cp_day: datetime) -> bool:
+        if entry_mode == "rank" and is_ml_strategy(signal_mode):
+            if p_up is None:
+                return False
+            if min_p_up_20d is not None and p_up < min_p_up_20d:
+                return False
+            return True
+        return cls in st.BUY_TIERS
+
     raw_by: dict[str, dict] = {}
-    classes: dict[str, list[tuple[datetime, str | None]]] = {}
+    classes: dict[str, list[CheckpointSignal]] = {}
 
     for i, tk in enumerate(tickers_list, 1):
         print(f"  [{i}/{len(tickers_list)}] fundamentals {tk} …", flush=True)
@@ -248,7 +279,7 @@ def run_dynamic(
         if px is None:
             print("    skip (no prices)")
             continue
-        qrows: list[tuple[datetime, str | None]] = []
+        qrows: list[CheckpointSignal] = []
         for cp in checkpoints:
             ly = cp.year - 1
             if uni_for_cp:
@@ -258,14 +289,23 @@ def run_dynamic(
             data = st.reconstruct_data_at(raw, cp)
             if data is None:
                 continue
+            sig_meta: dict = {}
             cl = st.classify_at(
                 data,
                 raw,
                 cp,
                 use_valuation=use_valuation,
                 signal_mode=signal_mode,
+                signal_meta=sig_meta if is_ml_strategy(signal_mode) else None,
+                spy_close_series=spy_feat,
             )
-            qrows.append((_norm_day(cp), cl))
+            p_up = sig_meta.get("p_up_20d") if is_ml_strategy(signal_mode) else None
+            if p_up is not None:
+                try:
+                    p_up = float(p_up)
+                except (TypeError, ValueError):
+                    p_up = None
+            qrows.append((_norm_day(cp), cl, p_up))
         if not qrows:
             continue
         qrows.sort(key=lambda x: x[0])
@@ -327,14 +367,19 @@ def run_dynamic(
             nav_pre += p.shares * float(row["Close"])
 
         # --- new entries ---
-        if len(positions) < max_positions and cash > 1e-6:
+        scale = gross_exposure_scale(spy_feat, d, bear_scale=bear_scale) if regime_filter else 1.0
+        eff_frac = position_frac * scale
+        if scale < 0.05:
+            eff_frac = 0.0
+
+        if len(positions) < max_positions and cash > 1e-6 and eff_frac > 0:
             for tk in sorted(raw_by.keys()):
                 if len(positions) >= max_positions:
                     break
                 if any(x.ticker == tk for x in positions):
                     continue
-                cls = _last_class_on_or_before(classes[tk], d)
-                if cls not in st.BUY_TIERS:
+                cls, p_up = _last_signal_on_or_before(classes[tk], d)
+                if not _eligible(cls, p_up, d):
                     continue
                 df = _prep_price_df(raw_by[tk]["price_history"])
                 if df is None:
@@ -347,7 +392,7 @@ def run_dynamic(
                 entry = float(row["Close"])
                 if entry <= 0:
                     continue
-                notional = min(position_frac * nav_pre, cash * 0.999)
+                notional = min(eff_frac * nav_pre, cash * 0.999)
                 if notional < 1e-4:
                     continue
                 shares = notional / entry
@@ -427,7 +472,31 @@ def main() -> None:
     ap.add_argument(
         "--signal-tech-ai",
         action="store_true",
-        help="Use technicals + projection_engine (no DCF in composite) mapped to BUY tiers.",
+        help="Same as --strategy ml (legacy flag).",
+    )
+    ap.add_argument(
+        "--strategy",
+        choices=("dcf", "ml"),
+        default="dcf",
+        help="dcf=valuation classifier (default); ml=Dolt-trained LightGBM via projection_engine.",
+    )
+    ap.add_argument(
+        "--min-p-up",
+        type=float,
+        default=None,
+        metavar="P",
+        help="ML mode only: require P(up) 20d >= P for breakout entry (default 0.52 when --strategy ml).",
+    )
+    ap.add_argument(
+        "--regime-filter",
+        action="store_true",
+        help="Scale down / skip new entries when SPY is below 200d MA.",
+    )
+    ap.add_argument(
+        "--entry-mode",
+        choices=("tier", "rank"),
+        default="tier",
+        help="tier=BUY/STRONG BUY only; rank=ML score gate (use with --strategy ml).",
     )
     ap.add_argument(
         "--checkpoint-freq",
@@ -440,6 +509,14 @@ def main() -> None:
 
     cp_min = args.checkpoint_min_year if args.checkpoint_min_year else None
     cp_cf = st._normalize_checkpoint_freq(args.checkpoint_freq)
+
+    strat = "ml" if args.signal_tech_ai else args.strategy
+    min_p = args.min_p_up
+    if min_p is None and strat == "ml":
+        min_p = 0.52
+    entry_m = args.entry_mode
+    if strat == "ml" and args.signal_tech_ai:
+        entry_m = "rank"
 
     try:
         p = run_dynamic(
@@ -458,8 +535,11 @@ def main() -> None:
             tickers=None,
             universe_map=None,
             use_valuation=not args.no_valuation,
-            signal_mode="tech_ai" if args.signal_tech_ai else "dcf",
+            signal_mode=strat,
             checkpoint_freq=cp_cf,
+            min_p_up_20d=min_p,
+            regime_filter=args.regime_filter or strat == "ml",
+            entry_mode=entry_m,
         )
         print(f"\nSaved animated HTML -> {p}")
     except RuntimeError as e:
