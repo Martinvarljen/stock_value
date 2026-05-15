@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import date
-
-from datetime import datetime
+from datetime import date, datetime
 
 from backtesting.strategy_backtest import reconstruct_data_at, reconstruct_price_only_at
 from portfolio.backtest import _cagr, _max_drawdown
