@@ -27,6 +27,7 @@ if _sa not in sys.path:
     sys.path.insert(0, _sa)
 
 from utils import _pct
+from projection_settings import load_projection_settings
 
 # Windows console fix
 for _s in ("stdout", "stderr"):
@@ -189,12 +190,17 @@ def _score_news(news_result: dict | None) -> float:
 
 # ── composite score ────────────────────────────────────────────────────────────
 
-def _composite_score(record: dict, news_result: dict | None = None) -> tuple[float, dict]:
+def _composite_score(
+    record: dict,
+    news_result: dict | None = None,
+    *,
+    exclude_valuation: bool = False,
+) -> tuple[float, dict]:
     """Weighted composite score -1 (very bearish) to +1 (very bullish)."""
     news_score = _score_news(news_result)
 
     raw_scores = {
-        "valuation_upside": _score_valuation(record),
+        "valuation_upside": 0.0 if exclude_valuation else _score_valuation(record),
         "momentum_trend":   _score_momentum(record),
         "rsi_signal":       _score_rsi(record),
         "quality_score":    _score_quality(record),
@@ -203,12 +209,18 @@ def _composite_score(record: dict, news_result: dict | None = None) -> tuple[flo
     }
 
     weights = dict(WEIGHTS)
+    if exclude_valuation:
+        vw = weights.pop("valuation_upside", 0.0)
+        tot = sum(weights.values())
+        if tot > 0:
+            weights = {k: v + (v / tot) * vw for k, v in weights.items()}
 
     if news_score is None:
         # Redistribute news weight proportionally to other factors
-        news_w = weights.pop("news_sentiment")
+        news_w = weights.pop("news_sentiment", 0.0)
         total_other = sum(weights.values())
-        weights = {k: v + v / total_other * news_w for k, v in weights.items()}
+        if total_other > 0:
+            weights = {k: v + v / total_other * news_w for k, v in weights.items()}
         scores = raw_scores
     else:
         raw_scores["news_sentiment"] = news_score
@@ -300,7 +312,12 @@ def _classify_signal(score: float) -> str:
     return "BEARISH"
 
 
-def _classify_confidence(scores: dict, record: dict, ml_used: bool) -> str:
+def _classify_confidence(
+    scores: dict,
+    record: dict,
+    ml_used: bool,
+    ml_rule_disagreement: bool = False,
+) -> str:
     positive = sum(1 for v in scores.values() if v > 0.1)
     negative = sum(1 for v in scores.values() if v < -0.1)
     agreement = max(positive, negative) / len(scores)
@@ -313,17 +330,29 @@ def _classify_confidence(scores: dict, record: dict, ml_used: bool) -> str:
         agreement = min(1.0, agreement * 1.1)  # slight boost when ML confirms
 
     if agreement > 0.8:
-        return "HIGH"
+        label = "HIGH"
     elif agreement > 0.6:
-        return "MEDIUM_HIGH"
+        label = "MEDIUM_HIGH"
     elif agreement > 0.4:
-        return "MEDIUM"
-    return "LOW"
+        label = "MEDIUM"
+    else:
+        label = "LOW"
+
+    if ml_rule_disagreement and label != "LOW":
+        order = ["HIGH", "MEDIUM_HIGH", "MEDIUM", "LOW"]
+        label = order[min(order.index(label) + 1, len(order) - 1)]
+    return label
 
 
 # ── main function ──────────────────────────────────────────────────────────────
 
-def generate_projections(record: dict, horizon_days: int = 120, news_result: dict | None = None) -> dict:
+def generate_projections(
+    record: dict,
+    horizon_days: int = 120,
+    news_result: dict | None = None,
+    *,
+    exclude_valuation: bool = False,
+) -> dict:
     """
     Generate forward projections from a fully-analyzed stock record.
 
@@ -331,8 +360,10 @@ def generate_projections(record: dict, horizon_days: int = 120, news_result: dic
         record:       Output from the stock_analyzer pipeline.
         horizon_days: Projection horizon in trading days.
         news_result:  Output from news_engine.analyze_news() — optional.
+        exclude_valuation: If True, drop DCF upside from the composite (weight redistributed
+            to momentum, RSI, quality, risk, growth, news).
     """
-    score, sub_scores = _composite_score(record, news_result)
+    score, sub_scores = _composite_score(record, news_result, exclude_valuation=exclude_valuation)
     price_raw = record.get("current_price")
     fair_value = record.get("fair_value_weighted")
 
@@ -353,23 +384,64 @@ def generate_projections(record: dict, horizon_days: int = 120, news_result: dic
     ml_p120 = _ml_probability(record, horizon_days)
     ml_used = any(x is not None for x in (ml_p5, ml_p20, ml_p60, ml_p120))
 
-    def _blend(ml_p, rule_p, ml_weight=0.6):
-        if ml_p is None:
-            return rule_p
-        return ml_weight * ml_p + (1 - ml_weight) * rule_p
+    settings = load_projection_settings()
+    ml_w = settings.ml_blend_weight
+    dthr = settings.ml_rule_disagreement_threshold
+    unc = settings.probability_uncertainty_half_width
 
-    p_up_5d = _blend(ml_p5, _rule_based_probability(score, 5))
-    p_up_20d = _blend(ml_p20, _rule_based_probability(score, 20))
-    p_up_60d = _blend(ml_p60, _rule_based_probability(score, 60))
-    p_up_120d = _blend(ml_p120, _rule_based_probability(score, horizon_days))
+    def _blend(ml_p: float | None, rule_p: float) -> tuple[float, float | None, float]:
+        if ml_p is None:
+            return rule_p, None, rule_p
+        return ml_w * ml_p + (1.0 - ml_w) * rule_p, ml_p, rule_p
+
+    r5 = _rule_based_probability(score, 5)
+    r20 = _rule_based_probability(score, 20)
+    r60 = _rule_based_probability(score, 60)
+    r120 = _rule_based_probability(score, horizon_days)
+
+    p_up_5d, ml5, rule5 = _blend(ml_p5, r5)
+    p_up_20d, ml20, rule20 = _blend(ml_p20, r20)
+    p_up_60d, ml60, rule60 = _blend(ml_p60, r60)
+    p_up_120d, ml120, rule120 = _blend(ml_p120, r120)
+
+    ml_vs_rule: dict[str, dict] = {}
+    for key, ml_p, rule_p in (
+        ("5d", ml5, r5),
+        ("20d", ml20, r20),
+        ("60d", ml60, r60),
+        ("horizon", ml120, r120),
+    ):
+        if ml_p is not None:
+            sp = abs(float(ml_p) - float(rule_p))
+            ml_vs_rule[key] = {
+                "ml": round(float(ml_p), 4),
+                "rule": round(float(rule_p), 4),
+                "spread": round(sp, 4),
+                "disagree": sp > dthr,
+            }
+    ml_rule_disagreement = any(d["disagree"] for d in ml_vs_rule.values()) if ml_vs_rule else False
+
+    def _band(p: float) -> tuple[float, float]:
+        lo = max(0.05, float(p) - unc)
+        hi = min(0.95, float(p) + unc)
+        return round(lo, 3), round(hi, 3)
+
+    probability_bands = {
+        "5d": _band(p_up_5d),
+        "20d": _band(p_up_20d),
+        "60d": _band(p_up_60d),
+        "horizon": _band(p_up_120d),
+    }
 
     er_5d = _score_to_expected_return(score, 5)
     er_20d = _score_to_expected_return(score, 20)
     er_60d = _score_to_expected_return(score, 60)
     er_120d = _score_to_expected_return(score, horizon_days)
 
-    signal     = _classify_signal(score)
-    confidence = _classify_confidence(sub_scores, record, ml_used)
+    signal = _classify_signal(score)
+    confidence = _classify_confidence(
+        sub_scores, record, ml_used, ml_rule_disagreement=ml_rule_disagreement
+    )
 
     paths = _generate_paths(
         current_price=price,
@@ -396,6 +468,9 @@ def generate_projections(record: dict, horizon_days: int = 120, news_result: dic
         "p_up_20d":              round(p_up_20d, 3),
         "p_up_60d":              round(p_up_60d, 3),
         "p_up_120d":             round(p_up_120d, 3),
+        # Aliases for the active horizon_days (p_up_120d / ER_120d are horizon-parameterized)
+        "p_up_horizon":          round(p_up_120d, 3),
+        "expected_return_horizon": round(er_120d, 4),
 
         "expected_return_5d":    round(er_5d, 4),
         "expected_return_20d":   round(er_20d, 4),
@@ -419,6 +494,11 @@ def generate_projections(record: dict, horizon_days: int = 120, news_result: dic
         "news":          news_result,
         "current_price": price,
         "horizon_days":  horizon_days,
+
+        "ml_blend_weight_used": round(ml_w, 3),
+        "ml_rule_disagreement": ml_rule_disagreement,
+        "ml_vs_rule":     ml_vs_rule,
+        "probability_bands": probability_bands,
     }
 
 
@@ -438,8 +518,15 @@ def print_projections(result: dict, ticker: str = ""):
     print(f"  Score:       {result['composite_score']:+.3f}")
     print(f"  ML model:    {'YES' if result['ml_used'] else 'no (rule-based fallback)'}")
     print()
-    print(f"  P(up)   5d: {result['p_up_5d']:.0%}   20d: {result['p_up_20d']:.0%}   60d: {result['p_up_60d']:.0%}   {result['horizon_days']}d: {result['p_up_120d']:.0%}")
-    print(f"  ExpRet  5d: {result['expected_return_5d']:+.1%}   20d: {result['expected_return_20d']:+.1%}   60d: {result['expected_return_60d']:+.1%}   {result['horizon_days']}d: {result['expected_return_120d']:+.1%}")
+    print(
+        f"  P(up)   5d: {result['p_up_5d']:.0%}   20d: {result['p_up_20d']:.0%}   "
+        f"60d: {result['p_up_60d']:.0%}   {result['horizon_days']}d: {result.get('p_up_horizon', result['p_up_120d']):.0%}"
+    )
+    print(
+        f"  ExpRet  5d: {result['expected_return_5d']:+.1%}   20d: {result['expected_return_20d']:+.1%}   "
+        f"60d: {result['expected_return_60d']:+.1%}   {result['horizon_days']}d: "
+        f"{result.get('expected_return_horizon', result['expected_return_120d']):+.1%}"
+    )
 
     t = result["targets"]
     print(f"\n  Targets ({result['horizon_days']}d):  Bull {t['bull']:.2f}  Base {t['base']:.2f}  Bear {t['bear']:.2f}")

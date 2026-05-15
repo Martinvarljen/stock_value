@@ -1,0 +1,7 @@
+{
+  "ml_blend_weight": 0.6,
+  "ml_rule_disagreement_threshold": 0.12,
+  "probability_uncertainty_half_width": 0.08,
+  "news_decay_half_life_hours": 72,
+  "anthropic_model": "claude-haiku-4-5-20251001"
+}

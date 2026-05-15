@@ -16,6 +16,11 @@ env/
 
 *.xlsx
 *.log
+*.feather
+
+projection/data/cache/*.feather
+backtesting/backtest_run_log.txt
+projection/ml_model/saved_models/training_log*.txt
 
 Thumbs.db
 Desktop.ini

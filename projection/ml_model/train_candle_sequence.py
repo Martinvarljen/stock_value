@@ -4,6 +4,11 @@ train_candle_sequence.py — Train LSTM to predict next H daily OHLC bars from l
 Uses normalized OHLC windows (scaled by last close) plus per-bar return and
 (H−L)/C (Kaufman-style emphasis on change vs. noise). Cross-ticker training.
 
+**Research hygiene:** sequence models overfit easily. Prefer many tickers, time-based
+train/val splits, early stopping on validation loss, and treat outputs as illustrative
+unless you publish clear out-of-sample metrics (see projection/ml_model/evaluate.py
+for the LightGBM side).
+
 Run (from Finance folder):
     python projection/ml_model/train_candle_sequence.py
     python projection/ml_model/train_candle_sequence.py --quick

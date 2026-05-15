@@ -7,24 +7,18 @@ import sys
 from datetime import datetime
 
 # ── engines ────────────────────────────────────────────────────────────────────
-from data_layer            import collect_data
-from quality_engine        import analyze_quality,       print_quality
-from financial_strength    import analyze_financials,    print_financials
-from valuation_engine      import analyze_valuation,     print_valuation
-from growth_engine         import analyze_growth,        print_growth
-from risk_engine           import analyze_risk,          print_risk
-from red_flags             import analyze_red_flags,     print_red_flags
-from classification_engine import classify_stock,        print_classification
-from sector_engine         import apply_sector_context,  print_sector_context
-from momentum_engine       import analyze_momentum,      print_momentum
-from technical_extended    import analyze_extended_technicals
-from elliott_engine        import analyze_elliott_context
-from trade_setup_engine    import build_trade_setup
-from candle_patterns       import analyze_candle_patterns
-from ohlcv_validate        import validate_ohlcv_from_data_dict
-from market_structure      import analyze_market_structure
-from backtest_engine       import analyze_price_history, print_price_history
-from explanation_engine    import generate_explanation,  print_explanation
+from pipeline              import build_analysis_bundle
+from quality_engine        import print_quality
+from financial_strength    import print_financials
+from valuation_engine      import print_valuation
+from growth_engine         import print_growth
+from risk_engine           import print_risk
+from red_flags             import print_red_flags
+from classification_engine import print_classification
+from sector_engine         import print_sector_context
+from momentum_engine       import print_momentum
+from backtest_engine       import print_price_history
+from explanation_engine    import print_explanation
 from peer_engine           import analyze_peers,         print_peers
 from excel_output          import write_excel
 
@@ -80,101 +74,31 @@ def analyze(tickers: list[str]) -> list[dict]:
     for i, ticker in enumerate(tickers, 1):
         print(f"[{i}/{len(tickers)}] Analyzing {ticker} ...", flush=True)
 
-        # Phase 1  data collection
-        data = collect_data(ticker)
-        if data.get("error"):
-            print(f"    Data error: {data['error']}")
-
-        # Skip ETFs — no income statement / balance sheet to analyse
-        if data.get("quote_type") == "ETF":
-            print(f"    Skipping ETF — fundamental analysis not applicable for {ticker}")
+        bundle, skip_reason = build_analysis_bundle(
+            ticker, MARGIN_OF_SAFETY, include_explanation=True
+        )
+        if bundle is None:
+            print(f"    Skipped: {skip_reason}")
             continue
 
-        if data.get("data_quality_score", 0) < 40:
-            print(f"    Low data quality ({data['data_quality_score']}/100) results may be unreliable")
+        record = bundle.record
+        sector_result = bundle.sector_result
+        quality_result = bundle.quality_result
+        financial_result = bundle.financial_result
+        valuation_result = bundle.valuation_result
+        growth_result = bundle.growth_result
+        risk_result = bundle.risk_result
+        red_flag_result = bundle.red_flag_result
+        momentum_result = bundle.momentum_result
+        backtest_result = bundle.backtest_result
+        clf_result = record["classification_result"]
+        explanation_result = record["explanation"]
 
-        # Sector context first — WACC adjustment must feed into valuation
-        sector_result = apply_sector_context(data)
-
-        # Phase 2  quality & financial strength
-        quality_result   = analyze_quality(data)
-        financial_result = analyze_financials(data)
-
-        # Phase 3  valuation (WACC + DCF + buy-below), with sector WACC override
-        valuation_result = analyze_valuation(
-            {**data, "sector_result": sector_result},
-            margin_of_safety=MARGIN_OF_SAFETY,
-            wacc_adjustment=sector_result["wacc_adjustment"],
-            terminal_growth_range=sector_result.get("terminal_growth_range"),
-        )
-
-        # Phase 4  growth trajectory + risk profile
-        growth_result    = analyze_growth(data)
-        risk_result      = analyze_risk(data)
-
-        # Red flags  pass WACC from valuation result for capital destruction check
-        wacc = valuation_result.get("wacc_data", {}).get("wacc")
-        red_flag_result = analyze_red_flags(data, wacc=wacc)
-
-        # Merge critical flags from all engines
-        all_critical = (
-            (financial_result.get("critical_flags") or []) +
-            (risk_result.get("critical_flags") or [])
-        )
-
-        record = {
-            **data,
-            "quality_metrics":    quality_result["quality_metrics"],
-            "quality_flags":      quality_result["quality_flags"],
-            "financial_metrics":  financial_result["financial_metrics"],
-            "financial_flags":    financial_result["financial_flags"],
-            "valuation_metrics":  valuation_result["valuation_metrics"],
-            "valuation_flags":    valuation_result["valuation_flags"],
-            "fair_value_weighted":valuation_result["fair_value_weighted"],
-            "buy_below_price":    valuation_result["buy_below_price"],
-            "wacc_data":          valuation_result["wacc_data"],
-            "scenarios":          valuation_result["scenarios"],
-            "tv_sensitivity":    valuation_result.get("tv_sensitivity"),
-            "growth_metrics":     growth_result["growth_metrics"],
-            "growth_flags":       growth_result["growth_flags"],
-            "risk_metrics":       risk_result["risk_metrics"],
-            "risk_flags":         risk_result["risk_flags"],
-            "red_flags":          red_flag_result["red_flags"],
-            "red_flag_summary":   red_flag_result["summary"],
-            "critical_flags":     all_critical,
-        }
-
-        # Momentum + price history — computed before classify/explain so timing signal is available
-        momentum_result = analyze_momentum(data)
-        backtest_result = analyze_price_history(data)
-
-        # Merge momentum into record so classify and explain can see it
-        record["momentum_metrics"]   = momentum_result["momentum_metrics"]
-        record["momentum_flags"]     = momentum_result["momentum_flags"]
-        record["momentum_trend"]     = momentum_result["trend"]
-        record["backtest_metrics"]   = backtest_result["backtest_metrics"]
-        record["backtest_flags"]     = backtest_result["backtest_flags"]
-
-        record["extended_technicals"] = analyze_extended_technicals(data)
-        record["elliott_context"]     = analyze_elliott_context(data)
-        record["candle_patterns"]     = analyze_candle_patterns(data)
-        record["ohlcv_quality"]       = validate_ohlcv_from_data_dict(data)
-        record["market_structure"]    = analyze_market_structure(data)
-
-        # Needed by classify_stock() sector growth sanity check (classification section 3b)
-        record["sector_result"]      = sector_result
-
-        # Classification — needs the full record assembled above
-        clf_result = classify_stock(record)
-        record["classification_result"] = clf_result
-        record["classification"]        = clf_result["classification"]
-        record["trade_setup"]             = build_trade_setup(record)
-
-        # Narrative explanation (momentum_trend / momentum_metrics now in record)
-        explanation_result = generate_explanation(record)
-
-        # Store remaining results in the record for peer comparison and Excel
-        record["explanation"]        = explanation_result
+        if record.get("data_quality_score", 0) < 40:
+            print(
+                f"    Low data quality ({record['data_quality_score']}/100) "
+                "results may be unreliable"
+            )
 
         results.append(record)
         _print_summary(record)

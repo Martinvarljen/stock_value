@@ -465,11 +465,20 @@ def collect_data(ticker: str) -> dict:
 
         result["rsi14"] = _rsi(close_1y.tolist())
 
-        # 1Y & 3Y historical return
+        # ~1 trading year return (≈252 sessions): last close vs close ~252 bars earlier
         try:
             p_now = price
-            p_1y_ago = float(close_1y.iloc[0]) if len(close_1y) >= 200 else None
-            result["return_1y"] = _safe((p_now - p_1y_ago) / p_1y_ago) if (p_now is not None and p_1y_ago not in (None, 0)) else None
+            n = len(close_1y)
+            if p_now is not None and n >= 2:
+                last_i = n - 1
+                bars = min(252, last_i)
+                ref_i = last_i - bars
+                p_1y_ago = float(close_1y.iloc[ref_i])
+                result["return_1y"] = (
+                    _safe((p_now - p_1y_ago) / p_1y_ago) if p_1y_ago not in (None, 0) else None
+                )
+            else:
+                result["return_1y"] = None
         except Exception:
             result["return_1y"] = None
 

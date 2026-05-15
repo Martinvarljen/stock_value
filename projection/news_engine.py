@@ -132,7 +132,18 @@ def _finbert_signed_score(label: str, confidence: float) -> float:
 
 # ── Claude analysis ────────────────────────────────────────────────────────────
 
-def _claude_analyze(ticker: str, headline: str, summary: str = "") -> dict:
+def _normalize_title(title: str) -> str:
+    """Collapse whitespace + lowercase for deduplication."""
+    return " ".join((title or "").lower().split())
+
+
+def _claude_analyze(
+    ticker: str,
+    headline: str,
+    summary: str = "",
+    *,
+    model: str,
+) -> dict:
     client = _get_anthropic()
     if client is None:
         return {"score": 0.0, "sentiment": "neutral", "reasoning": "Claude unavailable"}
@@ -156,7 +167,7 @@ JSON format:
 
     try:
         msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=model,
             max_tokens=150,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -221,7 +232,21 @@ def analyze_news(ticker: str, days_back: int = 7) -> dict:
         articles        list   per-article analysis
         summary         str    human-readable summary
     """
+    from projection_settings import load_projection_settings
+
+    sett = load_projection_settings()
+    claude_model = sett.anthropic_model
+
     articles = fetch_news(ticker, days_back)
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for a in articles:
+        key = _normalize_title(a.get("title") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(a)
+    articles = deduped
 
     if not articles:
         return {
@@ -247,7 +272,9 @@ def analyze_news(ticker: str, days_back: int = 7) -> dict:
         }
 
         if category in HIGH_IMPACT_CATEGORIES:
-            cl = _claude_analyze(ticker, article["title"], article.get("summary", ""))
+            cl = _claude_analyze(
+                ticker, article["title"], article.get("summary", ""), model=claude_model
+            )
             entry["claude_score"]     = round(float(cl.get("score", 0.0)), 3)
             entry["claude_sentiment"] = cl.get("sentiment", "neutral")
             entry["claude_reasoning"] = cl.get("reasoning", "")
@@ -259,8 +286,9 @@ def analyze_news(ticker: str, days_back: int = 7) -> dict:
 
         analyzed.append(entry)
 
-    # Weighted aggregate: high-impact × 2, recent × time-decay
+    # Weighted aggregate: high-impact × 2, recent × half-life decay (projection_settings)
     now = datetime.now()
+    half_life_h = max(float(sett.news_decay_half_life_hours), 1.0)
     total_weight = 0.0
     weighted_sum = 0.0
 
@@ -271,7 +299,7 @@ def analyze_news(ticker: str, days_back: int = 7) -> dict:
             age_hours = (now - datetime.fromisoformat(a["published_at"])).total_seconds() / 3600
         except Exception:
             age_hours = 24.0
-        time_weight = math.exp(-age_hours / 72)   # half-life ~72h
+        time_weight = math.exp(-math.log(2) * age_hours / half_life_h)
 
         weight = cat_weight * time_weight
         weighted_sum += a["final_score"] * weight
@@ -299,6 +327,8 @@ def analyze_news(ticker: str, days_back: int = 7) -> dict:
         "summary":         _make_summary(analyzed),
         "finbert_active":  _finbert not in (None, "unavailable"),
         "claude_active":   _anthropic_client not in (None, "unavailable"),
+        "decay_half_life_hours": half_life_h,
+        "claude_model":    claude_model,
     }
 
 

@@ -16,6 +16,7 @@ MODELS_DIR = Path(__file__).parent / "saved_models"
 
 # Module-level cache — reload when metadata on disk changes (e.g. after training)
 _cache: dict[int, object] = {}
+_calibrators: dict[int, object] = {}
 _meta: dict | None = None
 _disk_mtime_loaded: float | None = None
 _last_load_error: str | None = None
@@ -28,11 +29,12 @@ def _ensure_loaded() -> None:
     Streamlit keeps the process alive across reruns; a failed first load must
     not permanently block later loads after `trainer.py` writes new files.
     """
-    global _cache, _meta, _disk_mtime_loaded, _last_load_error
+    global _cache, _calibrators, _meta, _disk_mtime_loaded, _last_load_error
 
     meta_path = MODELS_DIR / "metadata.json"
     if not meta_path.exists():
         _cache.clear()
+        _calibrators.clear()
         _meta = None
         _disk_mtime_loaded = None
         _last_load_error = None
@@ -57,12 +59,25 @@ def _ensure_loaded() -> None:
             if model_path.exists():
                 new_cache[hi] = joblib.load(model_path)
         _cache = new_cache
+
+        cal_new: dict[int, object] = {}
+        for h in _meta.get("horizons", []):
+            hi = int(h)
+            cp = MODELS_DIR / f"calibrator_{hi}d.pkl"
+            if cp.exists():
+                try:
+                    cal_new[hi] = joblib.load(cp)
+                except Exception:
+                    pass
+        _calibrators = cal_new
+
         _disk_mtime_loaded = mt
         _last_load_error = None if _cache else "metadata.json found but no matching .pkl files"
     except Exception as e:
         _last_load_error = f"{type(e).__name__}: {e}"
         print(f"  [predictor] Model load error: {_last_load_error}")
         _cache.clear()
+        _calibrators.clear()
         _meta = None
         _disk_mtime_loaded = None
 
@@ -96,6 +111,10 @@ def ml_predict(features: dict, horizons: list[int] = None) -> dict[int, float] |
             continue
         try:
             prob = float(_cache[h].predict_proba(X)[0][1])
+            iso = _calibrators.get(h)
+            if iso is not None:
+                prob = float(iso.predict(np.array([prob], dtype=float))[0])
+                prob = max(0.0, min(1.0, prob))
             results[h] = round(prob, 4)
         except Exception as e:
             print(f"  [predictor] Inference error ({h}d): {e}")
@@ -153,7 +172,9 @@ def model_summary() -> str:
     n_samples = list(n.values())[0].get("n_samples", "?") if n else "?"
     n_tech = meta.get("n_tech_features", len(meta.get("feature_cols") or []))
     schema = meta.get("feature_schema_version", "?")
+    lbl = meta.get("label_mode", "raw")
+    cal = "isotonic OOF" if meta.get("calibrated") and _calibrators else "uncalibrated"
     return (
-        f"LightGBM trained {trained_at} | schema v{schema} | {n_tech} tech feats | "
-        f"{n_samples:,} samples | {auc_str}"
+        f"LightGBM trained {trained_at} | schema v{schema} | labels={lbl} | {cal} | "
+        f"{n_tech} tech feats | {n_samples:,} samples | {auc_str}"
     )

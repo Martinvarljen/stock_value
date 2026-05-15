@@ -1,0 +1,38 @@
+"""Tests for purge+embargo time-series splits."""
+
+import unittest
+
+import numpy as np
+import pandas as pd
+
+from projection.ml_model.splits import (
+    chronological_holdout_split,
+    gap_timedelta,
+    purged_time_series_splits,
+)
+
+
+class TestPurgedSplits(unittest.TestCase):
+    def test_gap_grows_with_horizon(self):
+        dates = pd.date_range("2020-01-01", periods=500, freq="B")
+        g5 = gap_timedelta(5, dates)
+        g120 = gap_timedelta(120, dates)
+        self.assertLess(g5, g120)
+
+    def test_purged_splits_no_overlap(self):
+        dates = pd.Series(pd.date_range("2018-01-01", periods=800, freq="B"))
+        for train_idx, val_idx in purged_time_series_splits(dates, n_splits=3, horizon_days=20):
+            self.assertTrue(train_idx.max() < val_idx.min())
+
+    def test_holdout_has_gap(self):
+        sub = pd.DataFrame({
+            "date": pd.date_range("2019-01-01", periods=400, freq="B"),
+            "x": np.random.randn(400),
+        })
+        tr, va = chronological_holdout_split(sub, val_fraction=0.2, horizon_days=5)
+        if not va.empty and not tr.empty:
+            self.assertLess(tr["date"].max(), va["date"].min())
+
+
+if __name__ == "__main__":
+    unittest.main()

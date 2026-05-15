@@ -23,7 +23,9 @@ Run with (from the Finance folder — important for imports):
 """
 
 import hashlib
+import html
 import math
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -43,30 +45,18 @@ for _p in [str(_ROOT / "stock_analyzer"), str(_ROOT / "projection")]:
         sys.path.insert(0, _p)
 
 from projection_engine import generate_projections
-from data_layer import collect_data
-from quality_engine import analyze_quality
-from financial_strength import analyze_financials
-from valuation_engine import analyze_valuation
-from growth_engine import analyze_growth
-from risk_engine import analyze_risk
-from red_flags import analyze_red_flags
-from classification_engine import classify_stock
-from sector_engine import apply_sector_context
-from momentum_engine import analyze_momentum
-from technical_extended import analyze_extended_technicals
-from elliott_engine import analyze_elliott_context
-from trade_setup_engine import build_trade_setup
-from candle_patterns import analyze_candle_patterns
-from ohlcv_validate import validate_ohlcv_from_data_dict
-from market_structure import analyze_market_structure
+from pipeline import build_analysis_bundle
 from news_engine import analyze_news
 try:
-    from ml_model.predictor import models_available, model_summary, models_load_hint
+    from ml_model.predictor import models_available, model_summary, models_load_hint, get_metadata
 except ImportError:
     from ml_model.predictor import models_available, model_summary
 
     def models_load_hint() -> str:
         return ""
+
+    def get_metadata():
+        return None
 
 try:
     from ml_model.candle_seq_infer import (
@@ -84,6 +74,38 @@ except ImportError:
 
     def predict_future_ohlc(hist, anchor_close=None):
         return None
+
+
+def _repro_info() -> str:
+    """Short provenance string for the sidebar (best-effort)."""
+    git = ""
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if r.returncode == 0:
+            git = r.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    meta: dict = {}
+    try:
+        meta = get_metadata() or {}
+    except Exception:
+        pass
+    schema = meta.get("feature_schema_version", "?")
+    trained = (meta.get("trained_at") or "")[:16]
+    lbl = meta.get("label_mode", "?")
+    cal = meta.get("calibrated", False)
+    parts = [f"Live clock: {datetime.now().strftime('%Y-%m-%d %H:%M')}"]
+    if git:
+        parts.append(f"git {git}")
+    parts.append(f"ML schema v{schema} · trained {trained} · labels={lbl} · calibrated={cal}")
+    return " · ".join(parts)
+
 
 # ── page config ────────────────────────────────────────────────────────────────
 
@@ -171,6 +193,21 @@ with st.sidebar:
 
     st.markdown("---")
     run_btn = st.button("🚀 Run Analysis", use_container_width=True, type="primary")
+    with st.expander("Research disclaimers & reproducibility", expanded=False):
+        st.markdown(
+            "**Not financial advice.** This tool is for education and research only. "
+            "Past model performance does not guarantee future results."
+        )
+        st.markdown(
+            "**Data (yfinance):** delayed quotes, occasional gaps or restatements vs "
+            "official filings. Do not rely on this as a single source for decisions."
+        )
+        st.markdown(
+            "**DCF vs short-horizon ML:** intrinsic fair value from fundamentals answers a "
+            "different question than P(up) from LightGBM. When **ML vs rule** diverges, "
+            "treat probabilities as exploratory."
+        )
+        st.caption(_repro_info())
     st.caption("Data: yfinance · 15min delay")
 
 
@@ -179,66 +216,12 @@ with st.sidebar:
 @st.cache_data(ttl=3600, show_spinner=False)
 def run_fundamentals(ticker: str, margin_of_safety: float) -> tuple:
     """Heavy pipeline — run once, cache 1 hour."""
-    data = collect_data(ticker)
-    if data.get("error") and data.get("data_quality_score", 0) < 20:
-        return None, f"Data error: {data.get('error')}"
-    if data.get("quote_type") == "ETF":
-        return None, "ETFs are not supported (no fundamental data)"
-
-    sector_result    = apply_sector_context(data)
-    quality_result   = analyze_quality(data)
-    financial_result = analyze_financials(data)
-
-    valuation_result = analyze_valuation(
-        {**data, "sector_result": sector_result},
-        margin_of_safety=margin_of_safety,
-        wacc_adjustment=sector_result["wacc_adjustment"],
-        terminal_growth_range=sector_result.get("terminal_growth_range"),
+    bundle, err = build_analysis_bundle(
+        ticker, margin_of_safety, include_explanation=False
     )
-
-    growth_result    = analyze_growth(data)
-    risk_result      = analyze_risk(data)
-    wacc             = valuation_result.get("wacc_data", {}).get("wacc")
-    red_flag_result  = analyze_red_flags(data, wacc=wacc)
-    momentum_result  = analyze_momentum(data)
-    extended_tech    = analyze_extended_technicals(data)
-    elliott_ctx      = analyze_elliott_context(data)
-    candle_ctx       = analyze_candle_patterns(data)
-    ohlcv_qc         = validate_ohlcv_from_data_dict(data)
-    mkt_struct       = analyze_market_structure(data)
-
-    all_critical = (
-        (financial_result.get("critical_flags") or []) +
-        (risk_result.get("critical_flags") or [])
-    )
-
-    record = {
-        **data,
-        "valuation_metrics":   valuation_result["valuation_metrics"],
-        "fair_value_weighted": valuation_result["fair_value_weighted"],
-        "buy_below_price":     valuation_result["buy_below_price"],
-        "wacc_data":           valuation_result["wacc_data"],
-        "scenarios":           valuation_result["scenarios"],
-        "growth_metrics":      growth_result["growth_metrics"],
-        "risk_metrics":        risk_result["risk_metrics"],
-        "red_flags":           red_flag_result["red_flags"],
-        "critical_flags":      all_critical,
-        "momentum_metrics":    momentum_result["momentum_metrics"],
-        "momentum_trend":      momentum_result["trend"],
-        "sector_result":       sector_result,
-        "extended_technicals": extended_tech,
-        "elliott_context":     elliott_ctx,
-        "candle_patterns":     candle_ctx,
-        "ohlcv_quality":       ohlcv_qc,
-        "market_structure":    mkt_struct,
-    }
-
-    clf = classify_stock(record)
-    record["classification"]        = clf["classification"]
-    record["classification_result"] = clf
-    record["trade_setup"]           = build_trade_setup(record)
-
-    return record, None
+    if bundle is None:
+        return None, err or "Analysis unavailable"
+    return bundle.record, None
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -530,6 +513,14 @@ def _prepare_live_projections(projections: dict) -> dict | None:
         projections["p_up_5d"] = projections.get("p_up_20d", 0.5)
     if "expected_return_5d" not in projections:
         projections["expected_return_5d"] = projections.get("expected_return_20d", 0.0)
+    projections.setdefault("ml_rule_disagreement", False)
+    projections.setdefault("ml_vs_rule", {})
+    projections.setdefault("probability_bands", {})
+    projections.setdefault("ml_blend_weight_used", 0.6)
+    projections.setdefault("p_up_horizon", projections.get("p_up_120d", 0.5))
+    projections.setdefault(
+        "expected_return_horizon", projections.get("expected_return_120d", 0.0)
+    )
     return projections
 
 
@@ -645,6 +636,8 @@ if (
             st.markdown(f'<div class="signal-{sig_class}">{signal}</div>', unsafe_allow_html=True)
             st.markdown(f"Confidence: **{projections['confidence']}**")
             st.markdown(f"Class: **{base_record.get('classification', 'N/A')}**")
+            if projections.get("ml_rule_disagreement"):
+                st.caption("⚠ ML vs rule-based P(up) diverged — see diagnostics.")
 
         # ── news bar ──────────────────────────────────────────────────────
         if news_result and news_result.get("available"):
@@ -672,8 +665,11 @@ if (
             st.metric("P(up 60d)", f"{projections['p_up_60d']:.0%}",
                       delta=f"{projections['expected_return_60d']:+.1%} exp.")
         with r1[3]:
-            st.metric(f"P(up {_horizon}d)", f"{projections['p_up_120d']:.0%}",
-                      delta=f"{projections['expected_return_120d']:+.1%} exp.")
+            st.metric(
+                f"P(up {_horizon}d)",
+                f"{projections.get('p_up_horizon', projections['p_up_120d']):.0%}",
+                delta=f"{projections.get('expected_return_horizon', projections['expected_return_120d']):+.1%} exp.",
+            )
         r2 = st.columns(4)
         with r2[0]:
             if fv:
@@ -690,7 +686,29 @@ if (
             else:
                 st.metric("Buy Below", "N/A")
         with r2[3]:
-            st.caption("P(up): LightGBM + rules. Run trainer.py after upgrades — feature schema v3 (long history + SPY regime).")
+            st.caption(
+                "P(up): LightGBM (optional isotonic cal.) + rules; blend weight in "
+                "projection/projection_settings.json. Run evaluate.py for walk-forward metrics."
+            )
+
+        if projections.get("ml_rule_disagreement"):
+            st.warning(
+                "ML and rule-based probabilities disagree beyond the configured threshold. "
+                "Do not treat the headline signal as high conviction."
+            )
+        bands = projections.get("probability_bands") or {}
+        mvr = projections.get("ml_vs_rule") or {}
+        if bands or mvr:
+            with st.expander("ML vs rule diagnostics & probability bands", expanded=False):
+                if mvr:
+                    st.dataframe(
+                        pd.DataFrame([{"horizon": k, **v} for k, v in mvr.items()]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                if bands:
+                    st.caption("Heuristic ± band around blended P(up) (not a formal confidence interval).")
+                    st.json(bands)
 
         st.markdown("---")
 
@@ -1099,14 +1117,18 @@ if (
                     card_cls = "news-pos" if score > 0.1 else ("news-neg" if score < -0.1 else "news-card")
                     badge    = " 🔴 HIGH IMPACT" if a["category"] in HIGH else ""
                     reasoning = a.get("claude_reasoning", "")
+                    esc_t = html.escape(a.get("title") or "")
+                    esc_pub = html.escape(str(a.get("publisher") or ""))
+                    esc_cat = html.escape(str(a.get("category") or ""))
+                    esc_reason = html.escape(str(reasoning)) if reasoning else ""
                     st.markdown(
                         f'<div class="news-card {card_cls}">'
-                        f"<b>{a['title']}</b>{badge}<br>"
+                        f"<b>{esc_t}</b>{badge}<br>"
                         f'<small style="color:#888;">'
-                        f"{a['publisher']} · {a['published_at'][:10]} · "
-                        f"category: {a['category']} · score: {score:+.2f}"
+                        f"{esc_pub} · {a['published_at'][:10]} · "
+                        f"category: {esc_cat} · score: {score:+.2f}"
                         f"</small>"
-                        + (f'<br><small style="color:#aaa;">{reasoning}</small>' if reasoning else "")
+                        + (f'<br><small style="color:#aaa;">{esc_reason}</small>' if esc_reason else "")
                         + "</div>",
                         unsafe_allow_html=True,
                     )
