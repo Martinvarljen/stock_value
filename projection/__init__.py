@@ -1,5 +1,5 @@
 """
-projection/ — AI projection layer for the stock dashboard.
+projection/ — ML projection layer (LightGBM + rule-based composite).
 
 Modules:
   projection_engine  : rule-based + ML hybrid forward projections

@@ -74,6 +74,5 @@ investment recommendations.
 
 - Sector-stratified or per-regime LightGBM heads when training rows carry a sector id.
 - Formal conformal or split-conformal intervals instead of the heuristic P(up) band
-  shown in the dashboard.
+  surfaced by the projection engine.
 - Meta-learned blend weights (stacking) for ML vs rule vs news, fit on validation years.
-- Optional dashboard authentication and rate limits for non-local deployments.

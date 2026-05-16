@@ -3,14 +3,56 @@ data_layer.py  —  Phase 1: yfinance data collection & cleaning
 
 collect_data(ticker) → dict with all raw & derived fields needed by scoring engines.
 All missing values are stored as None; callers must handle None gracefully.
+
+⚠️ POINT-IN-TIME WARNING — fundamental fields (income statement, balance
+sheet, cash flow, revenue/earnings histories, ratios derived from them)
+are pulled from yfinance, which serves the **latest restated** numbers
+rather than what was originally reported on each filing date. Restatements
+include retroactive segment reclassifications, accounting-standard
+transitions (ASC 606, ASC 842), audited correction of preliminary numbers,
+and post-merger pro-forma rebuilds.
+
+Implications
+------------
+* For **live trading** the restated number is what you'd consult today —
+  this is fine.
+* For **backtests of strategies that key off fundamentals** (DCF fair
+  value, ROIC, valuation upside, red-flag triggers based on capex/sales
+  ratios), you are reading the future. The audit estimates this can
+  inflate Sharpe by ~0.1-0.3 on fundamentals-heavy strategies.
+
+The cleanest fix is to source fundamentals from a true PIT provider
+(Compustat, SimFin Premium, or Sharadar) and bypass ``collect_data`` in
+the backtest reconstruction path. The first time ``collect_data`` is
+called we emit a one-off warning so users notice when running backtests.
 """
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import os
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
+
+
+_PIT_FUNDAMENTALS_WARNING = (
+    "yfinance fundamentals are restated, not point-in-time. Backtests that "
+    "key off fundamental fields (DCF fair value, ROIC, valuation upside, "
+    "red-flag triggers) are reading the future and overstate Sharpe by "
+    "an estimated 0.1-0.3. Use a PIT provider (Compustat / Sharadar / "
+    "SimFin Premium) for fundamentals-driven backtests. See module "
+    "docstring for details."
+)
+_PIT_WARNING_EMITTED = False
+
+
+def _warn_pit_fundamentals_once() -> None:
+    global _PIT_WARNING_EMITTED
+    if _PIT_WARNING_EMITTED:
+        return
+    warnings.warn(_PIT_FUNDAMENTALS_WARNING, stacklevel=2)
+    _PIT_WARNING_EMITTED = True
 
 
 # ── EUR exchange rate cache ───────────────────────────────────────────────────
@@ -128,15 +170,56 @@ def _rsi(prices, period=14):
 
 # ── main collector ────────────────────────────────────────────────────────────
 
-def collect_data(ticker: str) -> dict:
+def collect_data(
+    ticker: str,
+    *,
+    fundamentals_source: "Any | None" = None,
+    as_of: "Any | None" = None,
+) -> dict:
     """
     Pull all required data from yfinance for *ticker*.
     Returns a flat dict.  Never raises — missing fields become None.
+
+    PIT mode
+    --------
+    When ``fundamentals_source`` is supplied AND ``as_of`` is given, the
+    fundamental block (revenue, margins, balance-sheet ratios, 5y
+    series) comes from that source for the appropriate fiscal period;
+    only price/quote/sector identity comes from yfinance. This is the
+    intended path for valuation-driven backtests — see
+    ``stock_analyzer.fundamentals_source`` for source implementations.
+
+    When ``fundamentals_source`` is ``None`` (default) we use the legacy
+    yfinance fetch and emit a one-time restated-data warning so backtest
+    runners notice they are reading the future on fundamentals.
     """
+    if fundamentals_source is not None and as_of is not None:
+        try:
+            payload = fundamentals_source.get_as_of(ticker, as_of)
+        except Exception as e:
+            return {
+                "ticker": ticker,
+                "error": f"fundamentals_source error: {e}",
+                "data_quality_score": 0,
+            }
+        # Tag provenance so downstream callers can audit which source
+        # produced the row. Price/quote enrichment from yfinance still
+        # happens below if the caller wants it; for pure-fundamentals
+        # PIT runs (e.g. ``reconstruct_data_at``) the payload is enough.
+        payload.setdefault("ticker", ticker)
+        payload.setdefault("fundamentals_source",
+                           getattr(fundamentals_source, "name", lambda: "unknown")())
+        payload.setdefault("fundamentals_is_pit",
+                           getattr(fundamentals_source, "is_pit", lambda: False)())
+        return payload
+
+    _warn_pit_fundamentals_once()
     result = {
         "ticker": ticker,
         "error": None,
         "data_quality_score": 0,
+        "fundamentals_source": "yfinance_restated",
+        "fundamentals_is_pit": False,
     }
 
     try:

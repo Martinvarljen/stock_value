@@ -12,6 +12,8 @@ analyze_momentum(data) → dict with:
 All inputs come from data_layer fields — no extra API calls.
 """
 
+from __future__ import annotations
+
 from utils import _pct, _num
 
 

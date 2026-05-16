@@ -6,7 +6,9 @@ analysis is subjective. We only:
   • detect coarse swing highs / lows (fractal pivots on OHLC),
   • infer dominant direction,
   • project common Fibonacci retracements from the last clear leg,
-  • emit a plain-language *structure_hint* for dashboards.
+  • emit numeric features (``dominant_direction``, ``price_vs_nearest_fib``)
+    consumed by the ML feature builder, plus a plain-language *structure_hint*
+    that lands in the trade-setup memory log.
 """
 
 from __future__ import annotations

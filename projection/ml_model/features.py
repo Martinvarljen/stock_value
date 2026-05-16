@@ -25,6 +25,7 @@ MIN_OHLCV_BARS = 220
 
 # Technical features (OHLCV-derived). Order is fixed for saved models / metadata.
 # v3 (2026): v2 + long-horizon returns, drawdown, vol stress, panic proxy, SPY-relative regime.
+# v4 (2026): v3 + market-structure regime, candle-pattern bias, Elliott swing direction.
 TECH_FEATURES = [
     "rsi14",
     "price_vs_ma50",
@@ -57,9 +58,40 @@ TECH_FEATURES = [
     "tsm_reg20_fcst1d",
     "tsm_reg20_r2",
     "tsm_bias",
+    # v4: engine-derived structure / candle / Elliott context
+    "ms_regime_up",
+    "ms_regime_down",
+    "ms_n_pivots_norm",
+    "ms_pivot_dist_norm",
+    "cand_bias_bull",
+    "cand_bias_bear",
+    "cand_body_pct",
+    "cand_upper_wick_pct",
+    "cand_lower_wick_pct",
+    "ell_dir_up",
+    "ell_dir_down",
+    "ell_price_vs_fib_norm",
 ]
 
-FEATURE_SCHEMA_VERSION = 3
+FEATURE_SCHEMA_VERSION = 4
+
+# Neutral defaults for the v4 engine-derived block. Reused by the short-history
+# fallback and by ``_engine_features_from_arrays`` when an engine returns
+# ``available=False`` so missing context never silently becomes a strong signal.
+_ENGINE_FEATURE_DEFAULTS: dict[str, float] = {
+    "ms_regime_up": 0.0,
+    "ms_regime_down": 0.0,
+    "ms_n_pivots_norm": 0.0,
+    "ms_pivot_dist_norm": 0.0,
+    "cand_bias_bull": 0.0,
+    "cand_bias_bear": 0.0,
+    "cand_body_pct": 0.0,
+    "cand_upper_wick_pct": 0.0,
+    "cand_lower_wick_pct": 0.0,
+    "ell_dir_up": 0.0,
+    "ell_dir_down": 0.0,
+    "ell_price_vs_fib_norm": 0.0,
+}
 
 try:
     from kaufman_tsm import compute_kaufman_tsm as _compute_kaufman_tsm
@@ -87,7 +119,7 @@ _SPY_LIVE_CACHE_DATE: date | None = None
 
 
 def _get_live_spy_close_series() -> pd.Series | None:
-    """One SPY download per calendar day (live dashboard / inference)."""
+    """One SPY download per calendar day (live inference / daily run)."""
     global _SPY_LIVE_CACHE, _SPY_LIVE_CACHE_DATE
     today = date.today()
     if _SPY_LIVE_CACHE is not None and _SPY_LIVE_CACHE_DATE == today:
@@ -130,13 +162,17 @@ def extract_features(record: dict) -> dict:
     high_l = record.get("high_1y") or []
     low_l = record.get("low_1y") or []
     vol_l = record.get("volume_1y") or []
+    open_l = record.get("open_1y") or []
 
     tech: dict[str, float] | None = None
     if n >= MIN_OHLCV_BARS:
         h = high_l if len(high_l) == n else close_l
         l = low_l if len(low_l) == n else close_l
         v = vol_l if len(vol_l) == n else [1.0] * n
-        hist = pd.DataFrame({"Close": close_l, "High": h, "Low": l, "Volume": v})
+        cols = {"Close": close_l, "High": h, "Low": l, "Volume": v}
+        if len(open_l) == n:
+            cols["Open"] = open_l
+        hist = pd.DataFrame(cols)
         tech = technical_features_from_ohlcv(hist)
 
     if tech is None:
@@ -229,6 +265,7 @@ def _tech_fallback_from_record(record: dict, price: float) -> dict[str, float]:
         "tsm_bias",
     ):
         feat[_k] = 0.0
+    feat.update(_ENGINE_FEATURE_DEFAULTS)
     return feat
 
 
@@ -281,6 +318,7 @@ def technical_features_from_ohlcv(hist: pd.DataFrame) -> dict[str, float] | None
     high = hist["High"].astype(float) if "High" in hist.columns else close
     low = hist["Low"].astype(float) if "Low" in hist.columns else close
     vol = hist["Volume"].astype(float) if "Volume" in hist.columns else pd.Series(1.0, index=hist.index)
+    open_ = hist["Open"].astype(float) if "Open" in hist.columns else None
 
     price = float(close.iloc[-1])
     if price <= 0 or math.isnan(price):
@@ -334,6 +372,14 @@ def technical_features_from_ohlcv(hist: pd.DataFrame) -> dict[str, float] | None
 
     _apply_long_horizon_stress(feat, close, high, low, rets)
     _apply_tsm_ml_features(feat, close, high, low)
+
+    engine_feats = _engine_features_from_arrays(
+        open_.tolist() if open_ is not None else None,
+        high.tolist(),
+        low.tolist(),
+        close.tolist(),
+    )
+    feat.update(engine_feats)
 
     return feat
 
@@ -403,6 +449,89 @@ def _apply_spy_regime_features(
     except Exception:
         feat["rel_ret_63_vs_spy"] = 0.0
         feat["spy_dd_126d"] = 0.0
+
+
+def _engine_features_from_arrays(
+    open_l: list[float] | None,
+    high_l: list[float],
+    low_l: list[float],
+    close_l: list[float],
+) -> dict[str, float]:
+    """Compute the v4 engine-derived ML features from raw OHLC arrays.
+
+    Builds a minimal ``data`` dict and delegates to the three analytical
+    engines (``analyze_market_structure``, ``analyze_candle_patterns``,
+    ``analyze_elliott_context``) so the ML pipeline and the live trading
+    agent always see the same swing / candle / Elliott logic. Returns the
+    neutral defaults when an engine reports ``available=False`` or raises.
+
+    All output values are clipped to bounded ranges so a single
+    pathological bar can't blow up a feature column.
+    """
+    out: dict[str, float] = dict(_ENGINE_FEATURE_DEFAULTS)
+    if not close_l:
+        return out
+
+    last_close = float(close_l[-1])
+    if last_close <= 0 or math.isnan(last_close):
+        return out
+
+    data: dict = {
+        "close_1y": list(close_l),
+        "high_1y": list(high_l) if high_l else list(close_l),
+        "low_1y": list(low_l) if low_l else list(close_l),
+    }
+    if open_l is not None and len(open_l) == len(close_l):
+        data["open_1y"] = list(open_l)
+
+    try:
+        from market_structure import analyze_market_structure
+
+        ms = analyze_market_structure(data)
+        if ms.get("available"):
+            regime = ms.get("regime_hint") or ""
+            out["ms_regime_up"] = 1.0 if regime == "up_sequence" else 0.0
+            out["ms_regime_down"] = 1.0 if regime == "down_sequence" else 0.0
+            n_piv = ms.get("n_confirmed_pivots") or 0
+            out["ms_n_pivots_norm"] = max(0.0, min(1.0, float(n_piv) / 20.0))
+            dist = ms.get("last_close_vs_last_pivot")
+            if isinstance(dist, (int, float)) and not math.isnan(float(dist)):
+                norm = float(dist) / last_close
+                out["ms_pivot_dist_norm"] = max(-1.0, min(1.0, norm))
+    except Exception:
+        pass
+
+    try:
+        from candle_patterns import analyze_candle_patterns
+
+        cp = analyze_candle_patterns(data)
+        if cp.get("available"):
+            bias = cp.get("candle_bias") or "neutral"
+            out["cand_bias_bull"] = 1.0 if bias == "bullish" else 0.0
+            out["cand_bias_bear"] = 1.0 if bias == "bearish" else 0.0
+            anat = cp.get("last_bar_anatomy") or {}
+            out["cand_body_pct"] = float(anat.get("body_pct") or 0.0)
+            out["cand_upper_wick_pct"] = float(anat.get("upper_wick_pct") or 0.0)
+            out["cand_lower_wick_pct"] = float(anat.get("lower_wick_pct") or 0.0)
+    except Exception:
+        pass
+
+    try:
+        from elliott_engine import analyze_elliott_context
+
+        ell = analyze_elliott_context(data)
+        if ell.get("available"):
+            d = ell.get("dominant_direction") or ""
+            out["ell_dir_up"] = 1.0 if d == "up" else 0.0
+            out["ell_dir_down"] = 1.0 if d == "down" else 0.0
+            pv = ell.get("price_vs_nearest_fib")
+            if isinstance(pv, (int, float)) and not math.isnan(float(pv)):
+                norm = float(pv) / last_close
+                out["ell_price_vs_fib_norm"] = max(-0.5, min(0.5, norm))
+    except Exception:
+        pass
+
+    return out
 
 
 def _apply_tsm_ml_features(

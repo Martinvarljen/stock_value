@@ -1,10 +1,20 @@
 """
-backtesting  —  Strategy backtesting for the stock_analyzer pipeline.
+backtesting — strategy backtesting for the trading pipeline.
 
-Modules:
-  strategy_backtest   — fundamental classification vs forward returns
-  strategy_stat_tests — Donchian-style permutation / walk-forward Sharpe
-  vector_engine       — vector backtest: signal @ close, next-open execution, bps costs
-  performance_metrics — CAGR, Sharpe, drawdown, etc. from period returns
-  run_vector_backtest — CLI wrapper over yfinance + vector_engine
+Modules
+-------
+* ``dynamic_portfolio_backtest`` — production multi-asset event-driven
+  simulator. ``run_dynamic`` is the entry point. Models t+1 open fills,
+  per-leg commissions + slippage, short borrow, regime, ATR/vol-target
+  sizing.
+* ``strategy_backtest`` — checkpoint-style fundamental backtest (used
+  for valuation-driven research; PIT fundamentals via the
+  ``fundamentals_source`` argument on ``reconstruct_data_at``).
+* ``performance_metrics`` — CAGR, Sharpe, Sortino, Probabilistic /
+  Deflated Sharpe, t-stat, max drawdown.
+* ``regime`` — SPY trend regime + abstain-on-unknown.
+* ``ml_quant`` — calibrated/composite-aware quintile ranking.
+* ``yearly_top100_universe`` — legacy universe builder (survivorship-biased).
+* ``sp500_pit_universe`` — point-in-time S&P 500 membership reconstruction.
+* ``vector_engine`` — DEPRECATED. Use ``dynamic_portfolio_backtest`` instead.
 """

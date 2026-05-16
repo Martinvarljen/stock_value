@@ -1,24 +1,67 @@
 """
-vector_engine.py — Simple vector backtest (implementation brief §9.1).
+vector_engine.py — DEPRECATED single-asset vector backtest.
 
-Rules:
-  - Caller supplies a signal aligned to each bar (typically from prior closes, no lookahead).
-  - signal[i] is the position held over the interval from open[i+1] to open[i+2]
-    (decision after close[i], execute at open[i+1], capture until open[i+2]).
-  - Costs: on each position change, charge (commission_bps + slippage_bps) / 10_000
-    times |Δposition| (full-notional single-asset model, position in [-1, 1] or [0, 1]).
+⚠️ Status: deprecated. Use ``backtesting.dynamic_portfolio_backtest``.
+
+History
+-------
+This was the lookahead-free / cost-aware reference implementation
+written when the production-path simulator
+(``dynamic_portfolio_backtest``) didn't model costs or t+1 fills. As of
+the institutional-audit fix-up batch, ``dynamic_portfolio_backtest``
+now ships with:
+
+  * t+1 open fills (``--fill-at next_open`` is the default).
+  * Per-leg ``commission_bps`` / ``slippage_bps`` and short
+    ``borrow_bps_annual`` modelled in ``portfolio/broker.py`` and the
+    dynamic simulator itself.
+  * ATR-anchored stops and vol-targeted sizing.
+  * Regime-abstain, group-aware purged CV labels, etc.
+
+There is no longer a quality gap between the two engines; only a
+feature gap (vector engine is single-asset, dynamic simulator is
+multi-asset event-driven). Maintaining two simulators is a known trap
+(the audit explicitly flagged "two engines, wrong one is the default").
+
+Going forward
+-------------
+* Keep importing ``run_vector_backtest`` ONLY for the small number of
+  research notebooks that operate on a single time series; it now emits
+  a ``DeprecationWarning`` so accidental new usage is visible.
+* All multi-asset backtests should use
+  ``dynamic_portfolio_backtest.run_dynamic`` exclusively.
+* The ``run_vector_backtest.py`` CLI in this directory will be removed
+  in a future cleanup once the unit tests are migrated.
 
 Research only — not live execution.
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from .performance_metrics import summarize_backtest
+
+
+_DEPRECATION_WARNED = False
+
+
+def _warn_deprecation_once() -> None:
+    global _DEPRECATION_WARNED
+    if _DEPRECATION_WARNED:
+        return
+    warnings.warn(
+        "run_vector_backtest is deprecated. Use "
+        "dynamic_portfolio_backtest.run_dynamic instead — it now models "
+        "t+1 fills, commissions, slippage, and borrow fees.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    _DEPRECATION_WARNED = True
 
 
 def run_vector_backtest(
@@ -34,6 +77,7 @@ def run_vector_backtest(
 
     signal: length len(ohlcv), float/int in [-1,1] for long/short/flat or {0,1} long-only.
     """
+    _warn_deprecation_once()
     df = ohlcv.copy()
     if "open" not in df.columns:
         raise ValueError("ohlcv must include 'open'")

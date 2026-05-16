@@ -8,10 +8,11 @@ Rules (MVP, transparent defaults):
      Use ``--signal-tech-ai`` for BUY tiers from momentum/technicals + projection_engine
      (no DCF in composite; ML when a saved model exists). Use ``--no-valuation`` for DCF-off
      ``classification_engine`` only (same CLI as strategy_backtest.py).
-  2) Technical entry: first day on or after the checkpoint where Close breaks above the
-     prior N-day high (Donchian-style breakout; default N=20).
-  3) Exit: stop-loss 5% below entry close; take-profit 25% above entry ("price right" proxy);
-     or max hold 130 calendar days. Stops take precedence using that day's Low/High.
+  2) Technical entry (DCF / tier mode): 20-day high breakout on or after a BUY-tier
+     checkpoint. ML rank mode (default): enter on any session while P(up)20d passes the
+     gate — no breakout required — using the latest month-end (or quarter-end) score.
+  3) Exit: stop-loss 20% below entry; take-profit 40% above entry (default); or max hold 130
+     calendar days. Stops take precedence using that day's Low/High.
   4) Sizing: each new position uses ``position_frac`` of current NAV (default 10%), capped by
      cash and ``max_positions`` concurrent names.
   5) Benchmark: buy-and-hold SPY normalized to $1 on the first simulation day (never sold).
@@ -45,11 +46,20 @@ sys.path.insert(0, str(_ROOT / "stock_analyzer"))
 
 import backtesting.strategy_backtest as st
 from backtesting.regime import gross_exposure_scale, spy_close_series
+from reporting.dynamic_trade_trace import (
+    build_entry_reason,
+    build_entry_trace,
+    build_exit_trace,
+    build_short_entry_reason,
+    build_short_entry_trace,
+)
 from backtesting.strategy_modes import is_ml_strategy, normalize_signal_mode, strategy_display_name
 from backtesting.yearly_top100_universe import default_universe_cache_dir, load_universe_map_for_lag_years
 
+from typing import Optional, Tuple
+
 # (checkpoint_day, classification, optional p_up_20d for ML gate)
-CheckpointSignal = tuple[datetime, str | None, float | None]
+CheckpointSignal = Tuple[datetime, Optional[str], Optional[float]]
 
 
 @dataclass
@@ -61,6 +71,11 @@ class Position:
     take_profit: float
     entry_day: datetime
     peak: float
+    entry_p_up: float | None = None
+    entry_cls: str | None = None
+    entry_reason: str = ""
+    regime_scale_at_entry: float = 1.0
+    side: str = "long"  # "long" | "short"
 
 
 def _norm_day(ts) -> datetime:
@@ -101,6 +116,20 @@ def _row_asof(df: pd.DataFrame, d: datetime) -> pd.Series | None:
     if pos < 0:
         return None
     return df.iloc[int(pos)]
+
+
+def _next_bar_after(df: pd.DataFrame, d: datetime) -> pd.Series | None:
+    """First bar strictly after ``d``. Used for t+1 open fills so a signal
+    knowable only at today's close is executed on the next session's open.
+    Returns ``None`` if no later bar exists in the frame."""
+    ts = pd.Timestamp(_norm_day(d))
+    idx = df.index
+    if len(idx) == 0:
+        return None
+    pos = int(idx.searchsorted(ts, side="right"))
+    if pos >= len(idx):
+        return None
+    return df.iloc[pos]
 
 
 def _breakout_today(df: pd.DataFrame, d: datetime, n: int) -> bool:
@@ -180,6 +209,7 @@ def run_dynamic(
     out_html: Path | None,
     tickers: list[str] | None = None,
     universe_map: dict[int, list[str]] | None = None,
+    pit_universe: bool = False,
     use_valuation: bool = True,
     signal_mode: str = "dcf",
     checkpoint_freq: str | None = None,
@@ -187,9 +217,23 @@ def run_dynamic(
     regime_filter: bool = False,
     bear_scale: float = 0.35,
     entry_mode: str = "tier",
+    require_breakout: bool | None = None,
+    enable_short: bool = False,
+    max_p_up_short: float = 0.48,
+    # --- execution knobs ---
+    # Defaults match the pre-audit backtest (same-day close fills, zero
+    # explicit costs). Pass commission/slippage or fill_at="next_open" for
+    # the institutional-realism path.
+    commission_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+    borrow_bps_annual: float = 0.0,
+    fill_at: str = "close",
 ) -> Path:
     signal_mode = normalize_signal_mode(signal_mode)
     entry_mode = entry_mode.strip().lower()
+    if require_breakout is None:
+        # ML rank: enter when the model says go, not only on a Donchian breakout.
+        require_breakout = not (entry_mode == "rank" and is_ml_strategy(signal_mode))
     look = lookback_years
     if checkpoint_min_year is not None:
         y_now = datetime.today().year
@@ -206,9 +250,18 @@ def run_dynamic(
     if tickers is None:
         udir = universe_dir or default_universe_cache_dir(_ROOT)
         try:
-            uni = load_universe_map_for_lag_years(
-                lag_years, udir, auto_build_missing=auto_build_universe, verbose=True
-            )
+            if pit_universe:
+                # Survivorship-free path: per-year membership comes from
+                # the curated S&P 500 change-log + delisted overlay
+                # (see ``backtesting.sp500_pit_universe``). Cached on
+                # disk under ``dollar_volume_top100_pit/`` so subsequent
+                # runs are instant.
+                from backtesting.yearly_top100_universe import build_pit_universe_map
+                uni = build_pit_universe_map(lag_years, verbose=True)
+            else:
+                uni = load_universe_map_for_lag_years(
+                    lag_years, udir, auto_build_missing=auto_build_universe, verbose=True
+                )
         except FileNotFoundError as e:
             raise RuntimeError(
                 f"{e}\nBuild cache: python backtesting/build_yearly_top100_universe.py --from ... --to ..."
@@ -241,9 +294,17 @@ def run_dynamic(
     if is_ml_strategy(signal_mode):
         ml_note = f" Signals: {strategy_display_name(signal_mode)}."
         if min_p_up_20d is not None:
-            ml_note += f" Entry requires P(up) 20d >= {min_p_up_20d:.0%}."
+            ml_note += f" Long when P(up) 20d >= {min_p_up_20d:.0%}."
+        if enable_short:
+            ml_note += f" Short when P(up) 20d <= {max_p_up_short:.0%}."
+    if require_breakout:
+        entry_desc = f"BUY tiers + {breakout_days}d breakout"
+    elif entry_mode == "rank" and is_ml_strategy(signal_mode):
+        entry_desc = f"ML rank (P(up) gate, no breakout; scores refresh each {'month' if cf == 'M' else 'quarter'})"
+    else:
+        entry_desc = "BUY tiers"
     print(
-        f"Rules: BUY tiers only, {breakout_days}d high breakout, "
+        f"Rules: {entry_desc}, "
         f"stop {stop_loss:.0%}, TP {take_profit:.0%}, max hold {max_hold_days}d, "
         f"{position_frac:.0%} NAV/trade, max {max_positions} positions."
         + ("" if use_valuation or is_ml_strategy(signal_mode) else " Valuation engine OFF.")
@@ -253,7 +314,7 @@ def run_dynamic(
 
     spy_feat = spy_df["Close"].astype(float)
 
-    def _eligible(cls: str | None, p_up: float | None, cp_day: datetime) -> bool:
+    def _eligible_long(cls: str | None, p_up: float | None) -> bool:
         if entry_mode == "rank" and is_ml_strategy(signal_mode):
             if p_up is None:
                 return False
@@ -262,8 +323,20 @@ def run_dynamic(
             return True
         return cls in st.BUY_TIERS
 
+    def _eligible_short(cls: str | None, p_up: float | None) -> bool:
+        if not enable_short:
+            return False
+        if entry_mode == "rank" and is_ml_strategy(signal_mode):
+            return p_up is not None and p_up <= max_p_up_short
+        return cls in getattr(st, "SELL_TIERS", ("STRONG AVOID", "AVOID"))
+
     raw_by: dict[str, dict] = {}
     classes: dict[str, list[CheckpointSignal]] = {}
+    # Cache the cleaned price frame per ticker once. Earlier versions called
+    # ``_prep_price_df(raw["price_history"])`` inside the per-day inner loop,
+    # producing O(positions × days × universe) full-frame copies — the single
+    # biggest CPU cost in the backtest.
+    px_by: dict[str, pd.DataFrame] = {}
 
     for i, tk in enumerate(tickers_list, 1):
         print(f"  [{i}/{len(tickers_list)}] fundamentals {tk} …", flush=True)
@@ -310,6 +383,7 @@ def run_dynamic(
             continue
         qrows.sort(key=lambda x: x[0])
         raw_by[tk] = raw
+        px_by[tk] = px
         classes[tk] = qrows
 
     trading_days = sorted({_norm_day(x) for x in spy_df.index})
@@ -322,6 +396,14 @@ def run_dynamic(
     cash = 1.0
     positions: list[Position] = []
     daily_rows: list[tuple[datetime, float, float]] = []
+    ledger: list[dict] = []
+    traces: list[dict] = []
+
+    # Per-trade frictions. Hard-coded conservative defaults — easy to plumb
+    # to argparse later. Kept here rather than in the broker because this
+    # simulator is the production-path event-driven backtest today.
+    cost_one_way = float(commission_bps + slippage_bps) / 10_000.0  # round-trip = 2 × this
+    borrow_daily = float(borrow_bps_annual) / 10_000.0 / 252.0  # only meaningful for shorts
 
     for d in trading_days:
         spy_row = _row_asof(spy_df, d)
@@ -332,7 +414,7 @@ def run_dynamic(
         # --- exits first ---
         still: list[Position] = []
         for p in positions:
-            df = _prep_price_df(raw_by[p.ticker]["price_history"])
+            df = px_by.get(p.ticker)
             if df is None:
                 still.append(p)
                 continue
@@ -341,16 +423,62 @@ def run_dynamic(
                 still.append(p)
                 continue
             lo, hi, cl = float(row["Low"]), float(row["High"]), float(row["Close"])
-            p.peak = max(p.peak, cl)
+            side = getattr(p, "side", "long")
+            if side == "long":
+                p.peak = max(p.peak, cl)
             exit_px = None
-            if lo <= p.stop:
-                exit_px = p.stop
-            elif hi >= p.take_profit:
-                exit_px = p.take_profit
-            elif (d - p.entry_day).days >= max_hold_days:
-                exit_px = cl
+            exit_reason = ""
+            if side == "long":
+                if lo <= p.stop:
+                    exit_px = p.stop
+                    exit_reason = f"Stop loss ({stop_loss:.0%} below entry)"
+                elif hi >= p.take_profit:
+                    exit_px = p.take_profit
+                    exit_reason = f"Take profit ({take_profit:.0%} above entry)"
+                elif (d - p.entry_day).days >= max_hold_days:
+                    exit_px = cl
+                    exit_reason = f"Max hold {max_hold_days}d"
+            else:
+                if hi >= p.stop:
+                    exit_px = p.stop
+                    exit_reason = f"Stop loss ({stop_loss:.0%} above entry)"
+                elif lo <= p.take_profit:
+                    exit_px = p.take_profit
+                    exit_reason = f"Take profit ({take_profit:.0%} below entry)"
+                elif (d - p.entry_day).days >= max_hold_days:
+                    exit_px = cl
+                    exit_reason = f"Max hold {max_hold_days}d"
             if exit_px is not None:
-                cash += p.shares * exit_px
+                if side == "long":
+                    exit_px_net = exit_px * (1.0 - cost_one_way)
+                    cash += p.shares * exit_px_net
+                    pnl_pct = (exit_px_net / p.entry_price - 1.0) if p.entry_price > 0 else None
+                else:
+                    exit_px_net = exit_px * (1.0 + cost_one_way)
+                    cash -= p.shares * exit_px_net
+                    pnl_pct = (
+                        (p.entry_price - exit_px_net) / p.entry_price if p.entry_price > 0 else None
+                    )
+                ledger.append(
+                    {
+                        "date": _norm_day(d).date().isoformat(),
+                        "ticker": p.ticker,
+                        "action": "EXIT",
+                        "side": side,
+                        "price": exit_px_net,
+                        "reason": exit_reason,
+                        "pnl_pct": pnl_pct,
+                        "p_up_20d": p.entry_p_up,
+                    }
+                )
+                traces.append(
+                    build_exit_trace(
+                        ticker=p.ticker,
+                        day=d,
+                        reason=exit_reason,
+                        p_up_at_entry=p.entry_p_up,
+                    )
+                )
             else:
                 still.append(p)
         positions = still
@@ -358,66 +486,220 @@ def run_dynamic(
         # --- NAV for sizing (cash + open positions MTM) ---
         nav_pre = cash
         for p in positions:
-            df = _prep_price_df(raw_by[p.ticker]["price_history"])
+            df = px_by.get(p.ticker)
             if df is None:
                 continue
             row = _row_asof(df, d)
             if row is None:
                 continue
-            nav_pre += p.shares * float(row["Close"])
+            cl = float(row["Close"])
+            if getattr(p, "side", "long") == "long":
+                nav_pre += p.shares * cl
+            else:
+                nav_pre -= p.shares * cl
 
         # --- new entries ---
-        scale = gross_exposure_scale(spy_feat, d, bear_scale=bear_scale) if regime_filter else 1.0
+        # ``unknown_scale=bear_scale`` makes the regime gate *abstain* when
+        # SPY history is too short to classify (legacy behaviour was to
+        # default risk-on, i.e. trade into uncertainty).
+        scale = (
+            gross_exposure_scale(spy_feat, d, bear_scale=bear_scale)
+            if regime_filter
+            else 1.0
+        )
         eff_frac = position_frac * scale
         if scale < 0.05:
             eff_frac = 0.0
 
-        if len(positions) < max_positions and cash > 1e-6 and eff_frac > 0:
-            for tk in sorted(raw_by.keys()):
+        if len(positions) < max_positions and eff_frac > 0:
+
+            def _fill_entry(df_tk: pd.DataFrame) -> tuple[float, datetime] | None:
+                if fill_at == "close":
+                    row = _row_asof(df_tk, d)
+                    if row is None:
+                        return None
+                    return float(row["Close"]), d
+                nxt = _next_bar_after(df_tk, d)
+                if nxt is None:
+                    return None
+                entry_day = nxt.name.to_pydatetime() if hasattr(nxt.name, "to_pydatetime") else d
+                return float(nxt["Open"]), entry_day
+
+            long_cand: list[tuple[float, str]] = []
+            short_cand: list[tuple[float, str]] = []
+            for tk in raw_by.keys():
+                if any(x.ticker == tk for x in positions):
+                    continue
+                cls, p_up = _last_signal_on_or_before(classes[tk], d)
+                df_tk = px_by.get(tk)
+                if df_tk is None:
+                    continue
+                if _eligible_long(cls, p_up):
+                    if require_breakout and not _breakout_today(df_tk, d, breakout_days):
+                        pass
+                    else:
+                        long_cand.append((float(p_up) if p_up is not None else 0.0, tk))
+                if _eligible_short(cls, p_up):
+                    short_cand.append((float(p_up) if p_up is not None else 1.0, tk))
+            long_cand.sort(key=lambda r: (-r[0], r[1]))
+            short_cand.sort(key=lambda r: (r[0], r[1]))
+
+            entry_queue: list[tuple[bool, str]] = [(False, tk) for _, tk in long_cand] + [
+                (True, tk) for _, tk in short_cand
+            ]
+            for is_short, tk in entry_queue:
                 if len(positions) >= max_positions:
                     break
                 if any(x.ticker == tk for x in positions):
                     continue
-                cls, p_up = _last_signal_on_or_before(classes[tk], d)
-                if not _eligible(cls, p_up, d):
+                cls_ent, p_up_ent = _last_signal_on_or_before(classes[tk], d)
+                df_tk = px_by[tk]
+                filled = _fill_entry(df_tk)
+                if filled is None:
                     continue
-                df = _prep_price_df(raw_by[tk]["price_history"])
-                if df is None:
-                    continue
-                if not _breakout_today(df, d, breakout_days):
-                    continue
-                row = _row_asof(df, d)
-                if row is None:
-                    continue
-                entry = float(row["Close"])
+                entry, entry_day = filled
                 if entry <= 0:
                     continue
-                notional = min(eff_frac * nav_pre, cash * 0.999)
+                notional = min(eff_frac * nav_pre, max(cash, nav_pre) * 0.999)
                 if notional < 1e-4:
                     continue
-                shares = notional / entry
-                cash -= notional
-                positions.append(
-                    Position(
-                        ticker=tk,
-                        shares=shares,
-                        entry_price=entry,
-                        stop=entry * (1.0 - stop_loss),
-                        take_profit=entry * (1.0 + take_profit),
-                        entry_day=d,
-                        peak=entry,
+                cost = notional * cost_one_way
+                shares = (notional - cost) / entry
+                if is_short:
+                    cash += notional - cost
+                    entry_reason = build_short_entry_reason(
+                        p_up=p_up_ent,
+                        max_p_up=max_p_up_short,
+                        regime_scale=scale,
                     )
-                )
+                    positions.append(
+                        Position(
+                            ticker=tk,
+                            shares=shares,
+                            entry_price=entry,
+                            stop=entry * (1.0 + stop_loss),
+                            take_profit=entry * (1.0 - take_profit),
+                            entry_day=entry_day,
+                            peak=entry,
+                            entry_p_up=p_up_ent,
+                            entry_cls=cls_ent,
+                            entry_reason=entry_reason,
+                            regime_scale_at_entry=scale,
+                            side="short",
+                        )
+                    )
+                    ledger.append(
+                        {
+                            "date": _norm_day(entry_day).date().isoformat(),
+                            "ticker": tk,
+                            "action": "ENTER_SHORT",
+                            "side": "short",
+                            "price": entry,
+                            "notional": notional,
+                            "reason": entry_reason,
+                            "p_up_20d": p_up_ent,
+                        }
+                    )
+                    traces.append(
+                        build_short_entry_trace(
+                            ticker=tk,
+                            day=entry_day,
+                            p_up=p_up_ent,
+                            regime_scale=scale,
+                            reason=entry_reason,
+                            max_p_up=max_p_up_short,
+                        )
+                    )
+                else:
+                    if cash < notional * 0.999:
+                        continue
+                    cash -= notional
+                    entry_reason = build_entry_reason(
+                        p_up=p_up_ent,
+                        cls=cls_ent,
+                        min_p_up=min_p_up_20d,
+                        require_breakout=require_breakout,
+                        regime_scale=scale,
+                        entry_mode=entry_mode,
+                        ml_mode=is_ml_strategy(signal_mode),
+                    )
+                    positions.append(
+                        Position(
+                            ticker=tk,
+                            shares=shares,
+                            entry_price=entry,
+                            stop=entry * (1.0 - stop_loss),
+                            take_profit=entry * (1.0 + take_profit),
+                            entry_day=entry_day,
+                            peak=entry,
+                            entry_p_up=p_up_ent,
+                            entry_cls=cls_ent,
+                            entry_reason=entry_reason,
+                            regime_scale_at_entry=scale,
+                            side="long",
+                        )
+                    )
+                    ledger.append(
+                        {
+                            "date": _norm_day(entry_day).date().isoformat(),
+                            "ticker": tk,
+                            "action": "ENTER_LONG",
+                            "side": "long",
+                            "price": entry,
+                            "notional": notional,
+                            "reason": entry_reason,
+                            "p_up_20d": p_up_ent,
+                        }
+                    )
+                    traces.append(
+                        build_entry_trace(
+                            ticker=tk,
+                            day=entry_day,
+                            p_up=p_up_ent,
+                            regime_scale=scale,
+                            reason=entry_reason,
+                            min_p_up=min_p_up_20d,
+                        )
+                    )
+                nav_pre = cash
+                for p in positions:
+                    df = px_by.get(p.ticker)
+                    if df is None:
+                        continue
+                    row = _row_asof(df, d)
+                    if row is None:
+                        continue
+                    cl = float(row["Close"])
+                    if getattr(p, "side", "long") == "long":
+                        nav_pre += p.shares * cl
+                    else:
+                        nav_pre -= p.shares * cl
+
+        # --- daily borrow accrual on shorts ---
+        if borrow_daily > 0 and positions:
+            for p in positions:
+                if p.side == "short":
+                    df_tk = px_by.get(p.ticker)
+                    if df_tk is None:
+                        continue
+                    row = _row_asof(df_tk, d)
+                    if row is None:
+                        continue
+                    cash -= borrow_daily * p.shares * float(row["Close"])
 
         nav_end = cash
         for p in positions:
-            df = _prep_price_df(raw_by[p.ticker]["price_history"])
+            df = px_by.get(p.ticker)
             if df is None:
                 continue
             row = _row_asof(df, d)
             if row is None:
                 continue
-            nav_end += p.shares * float(row["Close"])
+            cl = float(row["Close"])
+            if getattr(p, "side", "long") == "long":
+                nav_end += p.shares * cl
+            else:
+                nav_end -= p.shares * cl
 
         spy_bh = spy_close / spy0 if spy0 > 0 else float("nan")
         daily_rows.append((d, nav_end, spy_bh))
@@ -437,12 +719,71 @@ def run_dynamic(
     monthly["month"] = pd.to_datetime(monthly["month"])
 
     out = out_html or (_ROOT / f"dynamic_vs_spy_{datetime.today().strftime('%Y%m%d')}.html")
+    out = Path(out)
     _write_monthly_animation_html(
         monthly,
-        Path(out),
+        out,
         "Dynamic strategy (fundamental + breakout) vs SPY buy-and-hold — monthly (animated)",
     )
-    return Path(out)
+
+    if ledger:
+        stem = out.with_suffix("")
+        trades_html = Path(f"{stem}_trades.html")
+        flow_html = Path(f"{stem}_pipeline.html")
+        trades_json = Path(f"{stem}_trades.json")
+        s0 = float(comb["strategy"].iloc[0]) if len(comb) else 1.0
+        s1 = float(comb["strategy"].iloc[-1]) if len(comb) else 1.0
+        b0 = float(comb["spy_bh"].iloc[0]) if len(comb) else 1.0
+        b1 = float(comb["spy_bh"].iloc[-1]) if len(comb) else 1.0
+        years = max((comb.index[-1] - comb.index[0]).days / 365.25, 1e-6) if len(comb) > 1 else 1.0
+        cagr_s = (s1 / s0) ** (1.0 / years) - 1.0 if s0 > 0 else None
+        cagr_b = (b1 / b0) ** (1.0 / years) - 1.0 if b0 > 0 else None
+        summary = {
+            "from": str(comb.index[0].date()) if len(comb) else "",
+            "to": str(comb.index[-1].date()) if len(comb) else "",
+            "years": round(years, 2),
+            "strategy_cagr": cagr_s,
+            "spy_cagr": cagr_b,
+            "final_nav": s1,
+            "final_spy_bh": b1,
+            "entry_mode": entry_mode,
+            "stop_loss_pct": stop_loss,
+            "take_profit_pct": take_profit,
+            "max_hold_days": max_hold_days,
+            "require_breakout": require_breakout,
+            "checkpoint_freq": cf,
+            "enable_short": enable_short,
+            "max_p_up_short": max_p_up_short,
+        }
+        from reporting.backtest_flow_html import write_flow_map_html
+        from reporting.backtest_viz import write_backtest_report
+
+        write_backtest_report(
+            curve=comb,
+            ledger=ledger,
+            snapshots=[],
+            summary=summary,
+            out_html=trades_html,
+            out_json=trades_json,
+        )
+        write_flow_map_html(
+            traces=traces,
+            ledger=ledger,
+            summary=summary,
+            out_html=flow_html,
+        )
+        n_round = len([r for r in ledger if r.get("action") == "EXIT"])
+        n_long = len([r for r in ledger if r.get("action") == "ENTER_LONG"])
+        n_short = len([r for r in ledger if r.get("action") == "ENTER_SHORT"])
+        print(
+            f"\n  Trade journal ({len(ledger)} events, {n_round} round-trips, "
+            f"{n_long} long entries, {n_short} short entries):\n"
+            f"    NAV + markers  -> {trades_html}\n"
+            f"    Pipeline map   -> {flow_html}\n"
+            f"    JSON log       -> {trades_json}"
+        )
+
+    return out
 
 
 def main() -> None:
@@ -457,13 +798,35 @@ def main() -> None:
     ap.add_argument("--universe-dir", type=Path, default=None)
     ap.add_argument("--auto-build-universe", action="store_true")
     ap.add_argument("--breakout-days", type=int, default=20)
-    ap.add_argument("--stop-loss", type=float, default=0.05)
-    ap.add_argument("--take-profit", type=float, default=0.25)
+    ap.add_argument("--stop-loss", type=float, default=0.20)
+    ap.add_argument(
+        "--take-profit",
+        type=float,
+        default=0.40,
+        help="Take-profit as fraction above entry (default 0.40 = 40%%).",
+    )
     ap.add_argument("--max-hold-days", type=int, default=130)
     ap.add_argument("--position-frac", type=float, default=0.10)
     ap.add_argument("--max-positions", type=int, default=10)
     ap.add_argument("--max-tickers", type=int, default=None, help="Limit universe size for a quick run")
+    ap.add_argument(
+        "--ticker",
+        nargs="+",
+        metavar="SYM",
+        help="Explicit ticker list (skips universe file; e.g. --ticker TSLA).",
+    )
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument(
+        "--enable-short",
+        action="store_true",
+        help="ML: also enter shorts when P(up)20d <= --max-p-up-short (default 0.42).",
+    )
+    ap.add_argument(
+        "--max-p-up-short",
+        type=float,
+        default=0.48,
+        help="Short entry when P(up)20d is at or below this (default 0.48; long gate is 0.52).",
+    )
     ap.add_argument(
         "--no-valuation",
         action="store_true",
@@ -505,6 +868,45 @@ def main() -> None:
         metavar="Q|M",
         help="Q=quarter-end (default), M=month-end — more frequent fundamental/signal refresh.",
     )
+    ap.add_argument(
+        "--realistic-costs",
+        action="store_true",
+        help="Institutional fills: 1+2 bps per leg, 50 bps borrow, entries at next open.",
+    )
+    ap.add_argument(
+        "--commission-bps",
+        type=float,
+        default=None,
+        help="Per-leg commission in bps (default 0; use --realistic-costs for 1.0).",
+    )
+    ap.add_argument(
+        "--slippage-bps",
+        type=float,
+        default=None,
+        help="Per-leg slippage in bps (default 0; use --realistic-costs for 2.0).",
+    )
+    ap.add_argument(
+        "--borrow-bps-annual",
+        type=float,
+        default=None,
+        help="Annualised short borrow bps (default 0; use --realistic-costs for 50).",
+    )
+    ap.add_argument(
+        "--fill-at",
+        choices=("next_open", "close"),
+        default=None,
+        help="Entry fill: close (default, legacy) or next_open (no same-day lookahead).",
+    )
+    ap.add_argument(
+        "--pit-universe",
+        action="store_true",
+        help=(
+            "Use the survivorship-free PIT S&P 500 universe (delisted "
+            "overlay from backtesting/sp500_changes.csv). Default is the "
+            "legacy current-list-only universe — see "
+            "yearly_top100_universe.py docstring for the bias warning."
+        ),
+    )
     args = ap.parse_args()
 
     cp_min = args.checkpoint_min_year if args.checkpoint_min_year else None
@@ -514,9 +916,20 @@ def main() -> None:
     min_p = args.min_p_up
     if min_p is None and strat == "ml":
         min_p = 0.52
-    entry_m = args.entry_mode
-    if strat == "ml" and args.signal_tech_ai:
-        entry_m = "rank"
+    # ML backtests use rank gate (P(up) threshold), not BUY-tier labels.
+    entry_m = "rank" if is_ml_strategy(strat) else args.entry_mode
+    enable_short = args.enable_short or is_ml_strategy(strat)
+
+    if args.realistic_costs:
+        commission_bps = 1.0
+        slippage_bps = 2.0
+        borrow_bps = 50.0
+        fill_at = "next_open"
+    else:
+        commission_bps = 0.0 if args.commission_bps is None else args.commission_bps
+        slippage_bps = 0.0 if args.slippage_bps is None else args.slippage_bps
+        borrow_bps = 0.0 if args.borrow_bps_annual is None else args.borrow_bps_annual
+        fill_at = "close" if args.fill_at is None else args.fill_at
 
     try:
         p = run_dynamic(
@@ -532,14 +945,21 @@ def main() -> None:
             max_positions=args.max_positions,
             max_tickers=args.max_tickers,
             out_html=args.out,
-            tickers=None,
+            tickers=[t.upper() for t in args.ticker] if args.ticker else None,
             universe_map=None,
+            pit_universe=args.pit_universe,
             use_valuation=not args.no_valuation,
             signal_mode=strat,
             checkpoint_freq=cp_cf,
             min_p_up_20d=min_p,
             regime_filter=args.regime_filter or strat == "ml",
             entry_mode=entry_m,
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
+            borrow_bps_annual=borrow_bps,
+            fill_at=fill_at,
+            enable_short=enable_short,
+            max_p_up_short=args.max_p_up_short,
         )
         print(f"\nSaved animated HTML -> {p}")
     except RuntimeError as e:

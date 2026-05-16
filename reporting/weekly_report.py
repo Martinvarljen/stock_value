@@ -2,8 +2,8 @@
 """
 Weekly paper-trading report from trade ledger + open positions.
 
-  python portfolio/weekly_report.py
-  python portfolio/weekly_report.py --days 7
+  python reporting/weekly_report.py
+  python reporting/weekly_report.py --days 7
 """
 
 from __future__ import annotations

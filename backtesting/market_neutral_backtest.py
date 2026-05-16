@@ -237,6 +237,7 @@ def run_market_neutral(
         auto_build_missing_universe=auto_build_universe,
         use_valuation=False,
         signal_mode="ml",
+        checkpoint_freq="M",
     )
     return run_market_neutral_from_results(
         results,

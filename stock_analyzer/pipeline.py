@@ -1,8 +1,10 @@
 """
-Shared fundamental analysis pipeline used by the CLI (main.py) and the dashboard.
+Shared fundamental + technical analysis pipeline.
 
-Returns an AnalysisBundle with the merged record plus engine outputs needed for
-console printing. Skips ETFs and failed / incomplete data fetches.
+Builds an :class:`AnalysisBundle` for one ticker — the merged flat record plus
+intermediate engine outputs. Consumed by :mod:`portfolio.analyze` (live trading
+agent), the backtest reconstruction path, and any future reporting. Skips ETFs
+and failed / incomplete data fetches.
 """
 
 from __future__ import annotations
@@ -26,13 +28,11 @@ from trade_setup_engine import build_trade_setup
 from candle_patterns import analyze_candle_patterns
 from ohlcv_validate import validate_ohlcv_from_data_dict
 from market_structure import analyze_market_structure
-from backtest_engine import analyze_price_history
-from explanation_engine import generate_explanation
 
 
 @dataclass
 class AnalysisBundle:
-    """One ticker: merged flat record plus intermediate engine dicts for CLI printing."""
+    """One ticker: merged flat record plus intermediate engine dicts."""
 
     record: dict[str, Any]
     sector_result: dict[str, Any]
@@ -43,7 +43,6 @@ class AnalysisBundle:
     risk_result: dict[str, Any]
     red_flag_result: dict[str, Any]
     momentum_result: dict[str, Any]
-    backtest_result: dict[str, Any]
 
 
 def build_analysis_bundle(
@@ -115,13 +114,10 @@ def build_analysis_bundle(
     }
 
     momentum_result = analyze_momentum(data)
-    backtest_result = analyze_price_history(data)
 
     record["momentum_metrics"] = momentum_result["momentum_metrics"]
     record["momentum_flags"] = momentum_result["momentum_flags"]
     record["momentum_trend"] = momentum_result["trend"]
-    record["backtest_metrics"] = backtest_result["backtest_metrics"]
-    record["backtest_flags"] = backtest_result["backtest_flags"]
 
     record["extended_technicals"] = analyze_extended_technicals(data)
     record["elliott_context"] = analyze_elliott_context(data)
@@ -136,6 +132,9 @@ def build_analysis_bundle(
     record["trade_setup"] = build_trade_setup(record)
 
     if include_explanation:
+        # Lazy-imported so the live decision path never pays for narrative
+        # generation unless the caller explicitly opts in.
+        from reporting.explanation_engine import generate_explanation
         record["explanation"] = generate_explanation(record)
 
     bundle = AnalysisBundle(
@@ -148,6 +147,5 @@ def build_analysis_bundle(
         risk_result=risk_result,
         red_flag_result=red_flag_result,
         momentum_result=momentum_result,
-        backtest_result=backtest_result,
     )
     return bundle, None

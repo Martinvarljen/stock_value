@@ -59,8 +59,14 @@ class TestProjectionEngine(unittest.TestCase):
         self.assertEqual(out["p_up_horizon"], out["p_up_120d"])
         self.assertEqual(out["expected_return_horizon"], out["expected_return_120d"])
         self.assertIn("ml_vs_rule", out)
-        self.assertIn("probability_bands", out)
         self.assertIn("ml_blend_weight_used", out)
+        # Cosmetic outputs intentionally removed — assert they're gone so a
+        # regression that re-adds them is caught.
+        self.assertNotIn("probability_bands", out)
+        self.assertNotIn("paths", out)
+        self.assertNotIn("upper_band", out)
+        self.assertNotIn("lower_band", out)
+        self.assertNotIn("targets", out)
 
     def test_composite_score_without_news_redistributes_weights(self) -> None:
         record = {

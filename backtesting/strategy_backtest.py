@@ -26,8 +26,10 @@ Usage:
     python backtesting/strategy_backtest.py --no-valuation   # dcf mode without DCF (classification_engine only)
 
 Dynamic entry/exit (default HTML when benchmark is on — same run as above):
-    Writes ``strategy_dynamic_vs_spy_YYYYMMDD.html`` (animated monthly strategy vs SPY buy-and-hold).
-    Optional: ``--legacy-html`` for the older diagnostic chart (scatter / quarterly / weighted basket).
+    Writes ``strategy_dynamic_*_vs_spy_YYYYMMDD.html`` (animated NAV vs SPY) plus:
+    ``*_trades.html`` (every entry/exit with hover reasons), ``*_pipeline.html`` (agent map),
+    ``*_trades.json`` (machine-readable log). Default TP is 40%%; use ``--run-tag NAME`` to
+    avoid overwriting same-day HTML. ML defaults: month-end checkpoints, rank entry, no breakout.
 
 Yearly top-100 universe (lagged one calendar year, no look-ahead), checkpoints from 2023 through today vs SPY by default:
     python backtesting/build_yearly_top100_universe.py --for-checkpoints-from-year 2023
@@ -43,6 +45,8 @@ Yearly top-100 universe (lagged one calendar year, no look-ahead), checkpoints f
     (built from prior-year dollar volume among current S&P 500 — see yearly_top100_universe.py).
     Optional: --auto-build-universe  to build missing year files (slow, many API calls).
 """
+
+from __future__ import annotations
 
 import sys
 import os
@@ -432,12 +436,89 @@ def reconstruct_price_only_at(raw: dict, as_of_date: datetime) -> dict | None:
     return result
 
 
-def reconstruct_data_at(raw: dict, as_of_date: datetime) -> dict | None:
+def reconstruct_data_pit(
+    raw: dict,
+    as_of_date: datetime,
+    fundamentals_source,
+) -> dict | None:
+    """PIT reconstruction: prices from yfinance, fundamentals from a
+    ``FundamentalsSource`` (typically ``CSVPointInTimeSource`` /
+    ``SimFinSource``).
+
+    The legacy ``reconstruct_data_at`` parses yfinance income/cash-flow
+    frames which contain RESTATED numbers; that's the lookahead this
+    path eliminates. We keep yfinance only for: price, sector identity,
+    beta, market-cap snapshot — fields where restatement either doesn't
+    apply or is small.
+    """
+    info = raw.get("info") or {}
+    ticker = raw["ticker"]
+    ph = raw.get("price_history")
+    price = _get_price_at(ph, as_of_date) if ph is not None else None
+    if price is None or price <= 0:
+        return None
+
+    currency = _safe(info.get("currency"))
+    if currency == "GBp":
+        price = price / 100
+        currency = "GBP"
+
+    as_of_d = as_of_date.date() if hasattr(as_of_date, "date") else as_of_date
+    try:
+        fund = fundamentals_source.get_as_of(ticker, as_of_d)
+    except Exception as e:
+        return {
+            "ticker": ticker,
+            "error": f"fundamentals_source error: {e}",
+            "data_quality_score": 0,
+        }
+    if not isinstance(fund, dict):
+        return None
+    if fund.get("error"):
+        return None
+
+    # Merge: PIT fundamentals win for fundamental fields; yfinance wins
+    # for identity / price snapshot. Sector falls through to fund value
+    # only when yfinance doesn't have it.
+    out = dict(fund)
+    out.setdefault("ticker", ticker)
+    out["current_price"] = float(price)
+    out["currency"] = out.get("currency") or currency
+    out.setdefault("company_name", _safe(info.get("longName") or info.get("shortName")))
+    out.setdefault("sector", _safe(info.get("sector")))
+    out.setdefault("industry", _safe(info.get("industry")))
+    out.setdefault("exchange", _safe(info.get("exchange")))
+    if not out.get("market_cap") and out.get("shares_outstanding"):
+        out["market_cap"] = float(price) * float(out["shares_outstanding"])
+    out["fundamentals_source"] = fundamentals_source.name()
+    out["fundamentals_is_pit"] = bool(fundamentals_source.is_pit())
+    out.setdefault("data_quality_score", 70)
+    out.setdefault("error", None)
+    return out
+
+
+def reconstruct_data_at(
+    raw: dict,
+    as_of_date: datetime,
+    *,
+    fundamentals_source=None,
+) -> dict | None:
     """
     Reconstruct a data dict as it would have appeared on `as_of_date`.
-    Only uses financials published before that date and the price on that date.
-    Returns None if insufficient data.
+
+    Default path (``fundamentals_source=None``): parses yfinance
+    income/balance/cash-flow frames at ``as_of_date``. yfinance serves
+    RESTATED numbers — for valuation-driven backtests this leaks the
+    future; pass a PIT ``fundamentals_source`` to fix.
+
+    PIT path (``fundamentals_source`` is not None): delegates to
+    ``reconstruct_data_pit``.
+
+    Returns ``None`` if insufficient data.
     """
+    if fundamentals_source is not None:
+        return reconstruct_data_pit(raw, as_of_date, fundamentals_source)
+    # ── legacy path (yfinance restated) ──
     info = raw["info"]
     ticker = raw["ticker"]
 
@@ -712,7 +793,12 @@ def _rsi14_from_closes(closes: list[float] | np.ndarray) -> float | None:
 
 
 def enrich_point_in_time_technicals(data: dict, raw: dict, as_of: datetime) -> None:
-    """Fill ``data`` price fields from ``raw['price_history']`` through ``as_of`` (mutates ``data``)."""
+    """Fill ``data`` price fields from ``raw['price_history']`` through ``as_of`` (mutates ``data``).
+
+    Also populates ``data['ohlcv_quality']`` so the checkpoint loop can gate on
+    broken bars (unsorted timestamps, OHLC body outside high/low, length
+    mismatches, all-NaN columns) exactly the way the live trading agent does.
+    """
     ph = raw.get("price_history")
     if ph is None or getattr(ph, "empty", True) or "Close" not in ph.columns:
         return
@@ -731,6 +817,8 @@ def enrich_point_in_time_technicals(data: dict, raw: dict, as_of: datetime) -> N
     last_n = min(252, n)
     tail = sub.iloc[-last_n:]
     data["close_1y"] = tail["Close"].astype(float).tolist()
+    if "Open" in tail.columns:
+        data["open_1y"] = tail["Open"].astype(float).tolist()
     if "High" in tail.columns:
         data["high_1y"] = tail["High"].astype(float).tolist()
     else:
@@ -743,6 +831,13 @@ def enrich_point_in_time_technicals(data: dict, raw: dict, as_of: datetime) -> N
         data["volume_1y"] = tail["Volume"].astype(float).fillna(0.0).tolist()
     else:
         data["volume_1y"] = [1.0] * len(data["close_1y"])
+
+    try:
+        from ohlcv_validate import validate_ohlcv_from_data_dict
+
+        data["ohlcv_quality"] = validate_ohlcv_from_data_dict(data)
+    except Exception as e:
+        data["ohlcv_quality"] = {"ok": False, "errors": [f"validator_error:{type(e).__name__}"]}
 
     arr = closes.to_numpy(dtype=float)
     data["ma50"] = float(closes.iloc[-50:].mean()) if n >= 50 else None
@@ -1110,6 +1205,10 @@ def run_backtest(
         if getattr(spy_feat.index, "tz", None) is not None:
             spy_feat.index = spy_feat.index.tz_localize(None)
 
+    from portfolio.data_gates import is_ohlcv_ok as _is_ohlcv_ok
+
+    n_ohlcv_skipped = 0
+
     for i, ticker in enumerate(all_tickers, 1):
         print(f"  [{i}/{len(all_tickers)}] {ticker} ... ", end="", flush=True)
 
@@ -1133,6 +1232,11 @@ def run_backtest(
 
             data = reconstruct_data_at(raw, cp_date)
             if data is None:
+                continue
+
+            gate_ok, _gate_reasons = _is_ohlcv_ok({"ohlcv_quality": data.get("ohlcv_quality")})
+            if not gate_ok:
+                n_ohlcv_skipped += 1
                 continue
 
             sig_meta: dict = {}
@@ -1199,6 +1303,12 @@ def run_backtest(
 
         print(f"{ticker_signals} signals")
 
+    if n_ohlcv_skipped:
+        print(
+            f"\n  OHLCV gate: skipped {n_ohlcv_skipped} checkpoint(s) with broken bars "
+            f"(unsorted dates, OHLC body outside high/low, length mismatch, all-NaN, …)."
+        )
+
     # Aggregate results
     by_tier = _aggregate_by_tier(signals)
     summary = _compute_summary(signals, by_tier)
@@ -1226,6 +1336,7 @@ def run_backtest(
         "use_valuation": use_valuation,
         "signal_mode": "ml" if is_ml_strategy(signal_mode) else MODE_DCF,
         "checkpoint_freq": cf,
+        "n_ohlcv_skipped": n_ohlcv_skipped,
     }
 
 
@@ -1512,274 +1623,9 @@ def _print_ticker_summary(signals: list[dict]):
         print(f"  {ticker:<10} {len(t_signals):>8} {most_common:>14} {avg_str:>12} {best_str:>8} {worst_str:>8}")
 
 
-# ── Excel export ──────────────────────────────────────────────────────────────
-
-def export_to_excel(results: dict, filepath: str | None = None) -> str:
-    """Export backtest results to an Excel workbook."""
-    try:
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    except ImportError:
-        print("  openpyxl not installed — skipping Excel export")
-        return ""
-
-    if filepath is None:
-        filepath = str(_ROOT / f"backtest_results_{datetime.today().strftime('%Y%m%d')}.xlsx")
-
-    wb = Workbook()
-
-    # Sheet 1: Summary by tier
-    ws = wb.active
-    ws.title = "By Classification"
-    bench = results.get("benchmark")
-    headers = ["Tier", "Signals", "Avg 3M", "Avg 6M", "Avg 12M", "Hit Rate 6M", "Best 6M", "Worst 6M"]
-    if bench:
-        headers += ["Avg Excess 6M", "Hit Excess 6M"]
-    for col, h in enumerate(headers, 1):
-        ws.cell(row=1, column=col, value=h).font = Font(bold=True)
-
-    row = 2
-    for tier in TIER_ORDER:
-        if tier not in results["by_tier"]:
-            continue
-        t = results["by_tier"][tier]
-        ws.cell(row=row, column=1, value=tier)
-        ws.cell(row=row, column=2, value=t["count"])
-        ws.cell(row=row, column=3, value=t.get("avg_3m"))
-        ws.cell(row=row, column=4, value=t.get("avg_6m"))
-        ws.cell(row=row, column=5, value=t.get("avg_12m"))
-        ws.cell(row=row, column=6, value=t.get("hit_rate_6m"))
-        ws.cell(row=row, column=7, value=t.get("best_6m"))
-        ws.cell(row=row, column=8, value=t.get("worst_6m"))
-        last_pct_col = 8
-        if bench:
-            ws.cell(row=row, column=9, value=t.get("avg_excess_6m"))
-            ws.cell(row=row, column=10, value=t.get("hit_rate_excess_6m"))
-            last_pct_col = 10
-        for col in range(3, last_pct_col + 1):
-            cell = ws.cell(row=row, column=col)
-            if cell.value is not None:
-                cell.number_format = "0.0%"
-        row += 1
-
-    # Sheet 2: All signals
-    ws2 = wb.create_sheet("All Signals")
-    has_univ = any("universe_lag_year" in s for s in results["signals"])
-    headers2 = ["Ticker", "Date", "Classification"]
-    if has_univ:
-        headers2.append("Univ lag Yr")
-    has_ml = any(s.get("p_up_20d") is not None for s in results["signals"])
-    headers2 += ["Price", "Fwd 3M", "Fwd 6M", "Fwd 12M"]
-    if has_ml:
-        headers2 += ["Proj signal", "P(up) 20d", "P(up) 60d", "ML used"]
-    if bench:
-        headers2 += ["Spy Fwd 3M", "Spy Fwd 6M", "Spy Fwd 12M", "Excess 3M", "Excess 6M", "Excess 12M"]
-    for col, h in enumerate(headers2, 1):
-        ws2.cell(row=1, column=col, value=h).font = Font(bold=True)
-
-    for row_idx, s in enumerate(results["signals"], 2):
-        col = 1
-        ws2.cell(row=row_idx, column=col, value=s["ticker"])
-        col += 1
-        ws2.cell(row=row_idx, column=col, value=s["date"].strftime("%Y-%m-%d"))
-        col += 1
-        ws2.cell(row=row_idx, column=col, value=s["classification"])
-        col += 1
-        if has_univ:
-            ws2.cell(row=row_idx, column=col, value=s.get("universe_lag_year"))
-            col += 1
-        ws2.cell(row=row_idx, column=col, value=s["price"])
-        col += 1
-        c_fwd3 = col
-        ws2.cell(row=row_idx, column=col, value=s.get("fwd_3m"))
-        col += 1
-        c_fwd6 = col
-        ws2.cell(row=row_idx, column=col, value=s.get("fwd_6m"))
-        col += 1
-        c_fwd12 = col
-        ws2.cell(row=row_idx, column=col, value=s.get("fwd_12m"))
-        col += 1
-        pct_cols = [c_fwd3, c_fwd6, c_fwd12]
-        if has_ml:
-            ws2.cell(row=row_idx, column=col, value=s.get("projection_signal"))
-            col += 1
-            c_p20 = col
-            ws2.cell(row=row_idx, column=col, value=s.get("p_up_20d"))
-            col += 1
-            c_p60 = col
-            ws2.cell(row=row_idx, column=col, value=s.get("p_up_60d"))
-            col += 1
-            ws2.cell(row=row_idx, column=col, value=s.get("ml_used"))
-            col += 1
-            pct_cols.extend([c_p20, c_p60])
-        if bench:
-            c0 = col
-            ws2.cell(row=row_idx, column=col, value=s.get("spy_fwd_3m"))
-            col += 1
-            ws2.cell(row=row_idx, column=col, value=s.get("spy_fwd_6m"))
-            col += 1
-            ws2.cell(row=row_idx, column=col, value=s.get("spy_fwd_12m"))
-            col += 1
-            ws2.cell(row=row_idx, column=col, value=s.get("excess_fwd_3m"))
-            col += 1
-            ws2.cell(row=row_idx, column=col, value=s.get("excess_fwd_6m"))
-            col += 1
-            ws2.cell(row=row_idx, column=col, value=s.get("excess_fwd_12m"))
-            col += 1
-            pct_cols.extend(range(c0, c0 + 6))
-        for pc in pct_cols:
-            cell = ws2.cell(row=row_idx, column=pc)
-            if cell.value is not None:
-                cell.number_format = "0.0%"
-
-    wb.save(filepath)
-    return filepath
-
-
-def export_backtest_vs_benchmark_html(
-    results: dict,
-    filepath: str | None = None,
-    *,
-    portfolio_weight_mode: str = "tier",
-) -> str:
-    """
-    Write a standalone Plotly HTML chart: per-signal 6M excess vs benchmark, quarterly averages,
-    and a sequential **weighted BUY basket** vs same-weight SPY (non-overlapping 6M holds).
-    """
-    try:
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
-    except ImportError:
-        print("  plotly not installed — skipping HTML chart export")
-        return ""
-
-    bench = results.get("benchmark")
-    if not bench:
-        return ""
-
-    signals = [s for s in results["signals"] if s.get("excess_fwd_6m") is not None]
-    if not signals:
-        print("  No 6M excess vs benchmark — skipping HTML chart (need SPY data at each signal)")
-        return ""
-
-    if filepath is None:
-        filepath = str(_ROOT / f"backtest_vs_{bench.lower()}_{datetime.today().strftime('%Y%m%d')}.html")
-
-    tier_colors = {
-        "STRONG BUY": "#2ecc71",
-        "BUY": "#58d68d",
-        "WATCHLIST": "#f4d03f",
-        "HOLD": "#95a5a6",
-        "AVOID": "#e74c3c",
-        "STRONG AVOID": "#c0392b",
-    }
-
-    fig = make_subplots(
-        rows=3,
-        cols=1,
-        shared_xaxes=False,
-        vertical_spacing=0.10,
-        subplot_titles=(
-            f"6-month forward excess vs {bench} (each point = one ticker at one checkpoint)",
-            f"Average 6M excess vs {bench} by signal quarter (mean of overlapping signals in bucket)",
-            f"Cumulative $1 — sequential weighted BUY basket vs {bench} (same weights; {portfolio_weight_mode}-weighted names)",
-        ),
-        row_heights=[0.36, 0.28, 0.36],
-    )
-
-    for tier in TIER_ORDER:
-        sub = [s for s in signals if s.get("classification") == tier]
-        if not sub:
-            continue
-        fig.add_trace(
-            go.Scatter(
-                x=[s["date"] for s in sub],
-                y=[s["excess_fwd_6m"] for s in sub],
-                mode="markers",
-                name=tier,
-                marker=dict(color=tier_colors.get(tier, "#3498db"), size=7, opacity=0.75),
-                text=[f"{s['ticker']} @ {s['date'].strftime('%Y-%m-%d')}" for s in sub],
-                hovertemplate="%{text}<br>Excess 6M: %{y:.2%}<extra></extra>",
-            ),
-            row=1,
-            col=1,
-        )
-
-    fig.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5, row=1, col=1)
-
-    df = pd.DataFrame(
-        {"date": [s["date"] for s in signals], "excess_fwd_6m": [s["excess_fwd_6m"] for s in signals]}
-    )
-    df["date"] = pd.to_datetime(df["date"])
-    df["q_end"] = df["date"].dt.to_period("Q").dt.to_timestamp(how="end")
-    qmean = df.groupby("q_end", as_index=False)["excess_fwd_6m"].mean()
-
-    fig.add_trace(
-        go.Bar(
-            x=qmean["q_end"],
-            y=qmean["excess_fwd_6m"],
-            name="Quarter avg excess",
-            marker_color="#5dade2",
-            hovertemplate="Quarter ending %{x|%Y-%m-%d}<br>Mean excess 6M: %{y:.2%}<extra></extra>",
-        ),
-        row=2,
-        col=1,
-    )
-    fig.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5, row=2, col=1)
-
-    curve = sequential_weighted_equity_curve(
-        results["signals"],
-        weight_mode=portfolio_weight_mode if portfolio_weight_mode in ("tier", "equal") else "tier",
-    )
-    if not curve.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=curve["exit_date"],
-                y=curve["equity_stock"],
-                mode="lines+markers",
-                name="BUY basket (strategy)",
-                line=dict(color="#2ecc71", width=2),
-                marker=dict(size=8),
-                hovertemplate="Exit %{x|%Y-%m-%d}<br>Equity: %{y:.3f}<extra></extra>",
-            ),
-            row=3,
-            col=1,
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=curve["exit_date"],
-                y=curve["equity_spy"],
-                mode="lines+markers",
-                name=f"Same basket × {bench}",
-                line=dict(color="#aeb6bf", width=2, dash="dot"),
-                marker=dict(size=8),
-                hovertemplate="Exit %{x|%Y-%m-%d}<br>Equity: %{y:.3f}<extra></extra>",
-            ),
-            row=3,
-            col=1,
-        )
-        fig.add_hline(y=1.0, line_dash="dash", line_color="white", opacity=0.4, row=3, col=1)
-
-    fig.update_layout(
-        template="plotly_dark",
-        height=1020,
-        title=dict(
-            text=f"Backtest vs {bench} (excess = stock 6M forward − {bench} 6M forward)",
-            x=0.02,
-            xanchor="left",
-        ),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(t=100, b=60),
-    )
-    fig.update_yaxes(tickformat=".0%", row=1, col=1)
-    fig.update_yaxes(tickformat=".0%", row=2, col=1)
-    fig.update_yaxes(tickformat=".3f", row=3, col=1)
-    fig.update_xaxes(title_text="Checkpoint date", row=1, col=1)
-    fig.update_xaxes(title_text="Quarter (end)", row=2, col=1)
-    fig.update_xaxes(title_text="Hold exit date (end of each 6M window)", row=3, col=1)
-
-    fig.write_html(filepath, include_plotlyjs="cdn", config={"displayModeBar": True})
-    return filepath
+# Excel + legacy diagnostic HTML exporters intentionally removed.
+# Canonical backtest artifacts: console summary (`print_backtest_results`) and
+# the animated Plotly file written by `dynamic_portfolio_backtest.run_dynamic`.
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
@@ -1802,11 +1648,13 @@ def main():
     universe_dir: Path | None = None
     auto_build_universe = False
     portfolio_weight = "tier"
-    legacy_html = False
     use_valuation = True
     signal_mode = "dcf"
     checkpoint_freq: str | None = None
     run_market_neutral_flag = False
+    stop_loss = 0.20
+    take_profit = 0.40
+    run_tag: str | None = None
 
     args = sys.argv[1:]
     i = 0
@@ -1841,9 +1689,6 @@ def main():
         elif a == "--portfolio-weight" and i + 1 < len(args):
             portfolio_weight = args[i + 1].strip().lower()
             i += 2
-        elif a == "--legacy-html":
-            legacy_html = True
-            i += 1
         elif a == "--no-valuation":
             use_valuation = False
             i += 1
@@ -1858,6 +1703,15 @@ def main():
             i += 1
         elif a == "--checkpoint-freq" and i + 1 < len(args):
             checkpoint_freq = args[i + 1]
+            i += 2
+        elif a == "--stop-loss" and i + 1 < len(args):
+            stop_loss = float(args[i + 1])
+            i += 2
+        elif a == "--take-profit" and i + 1 < len(args):
+            take_profit = float(args[i + 1])
+            i += 2
+        elif a == "--run-tag" and i + 1 < len(args):
+            run_tag = "".join(c if c.isalnum() or c in "-_" else "_" for c in args[i + 1].strip())
             i += 2
         elif a == "--help":
             print(__doc__)
@@ -1918,6 +1772,9 @@ def main():
         checkpoint_min_year = DEFAULT_TOP100_CHECKPOINT_MIN_YEAR
 
     signal_mode = normalize_signal_mode(signal_mode)
+    if checkpoint_freq is None:
+        # ML: refresh scores every month (~3× more entry windows than quarter-end).
+        checkpoint_freq = "M" if is_ml_strategy(signal_mode) else "Q"
 
     print(f"\nStrategy Backtest — {datetime.today().strftime('%Y-%m-%d')}")
 
@@ -1944,28 +1801,23 @@ def main():
         return
     print_backtest_results(results)
 
-    # Excel export
-    try:
-        path = export_to_excel(results)
-        if path:
-            print(f"\n  Excel report saved -> {path}")
-    except Exception as e:
-        print(f"\n  Excel export failed: {e}")
-
     if bm_arg and results.get("tickers"):
         try:
             from backtesting.dynamic_portfolio_backtest import run_dynamic
 
             dyn_suffix = "ml" if is_ml_strategy(results.get("signal_mode")) else "dcf"
-            dyn_path = _ROOT / f"strategy_dynamic_{dyn_suffix}_vs_spy_{datetime.today().strftime('%Y%m%d')}.html"
+            tag_part = f"_{run_tag}" if run_tag else ""
+            dyn_path = _ROOT / (
+                f"strategy_dynamic_{dyn_suffix}{tag_part}_vs_spy_{datetime.today().strftime('%Y%m%d')}.html"
+            )
             run_dynamic(
                 lookback_years=lookback,
                 checkpoint_min_year=checkpoint_min_year,
                 universe_dir=universe_dir,
                 auto_build_universe=auto_build_universe,
                 breakout_days=20,
-                stop_loss=0.05,
-                take_profit=0.25,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
                 max_hold_days=130,
                 position_frac=0.10,
                 max_positions=10,
@@ -1979,9 +1831,16 @@ def main():
                 min_p_up_20d=0.52 if is_ml_strategy(results.get("signal_mode")) else None,
                 regime_filter=is_ml_strategy(results.get("signal_mode")),
                 entry_mode="rank" if is_ml_strategy(results.get("signal_mode")) else "tier",
+                require_breakout=False if is_ml_strategy(results.get("signal_mode")) else True,
+                enable_short=is_ml_strategy(results.get("signal_mode")),
+                max_p_up_short=0.48,
             )
+            stem = dyn_path.with_suffix("")
             print(f"\n  Dynamic strategy vs SPY buy-and-hold (animated monthly) -> {dyn_path}")
             print("     Use the slider / Play control to step through months.")
+            print(f"  Trade reasons (hover markers) -> {stem}_trades.html")
+            print(f"  Pipeline map (why enter/skip) -> {stem}_pipeline.html")
+            print(f"  Trade log JSON -> {stem}_trades.json")
         except Exception as e:
             print(f"\n  Dynamic HTML export failed: {e}")
 
@@ -1993,14 +1852,6 @@ def main():
             print(f"  Market-neutral L/S chart -> {mn['html']}")
         except Exception as e:
             print(f"\n  Market-neutral backtest failed: {e}")
-
-    if bm_arg and legacy_html:
-        try:
-            hpath = export_backtest_vs_benchmark_html(results, portfolio_weight_mode=portfolio_weight)
-            if hpath:
-                print(f"\n  Legacy diagnostic chart -> {hpath}")
-        except Exception as e:
-            print(f"\n  Legacy HTML export failed: {e}")
 
 
 if __name__ == "__main__":

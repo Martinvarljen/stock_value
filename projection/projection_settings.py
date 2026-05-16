@@ -42,6 +42,9 @@ def load_projection_settings() -> ProjectionSettings:
         except (TypeError, ValueError):
             return float(default)
 
+    # Default 0.6 ML / 0.4 rule — matches projection_settings.json and the
+    # behaviour that shipped before the institutional audit. Set to 1.0 in
+    # JSON when you want pure calibrated ML.
     blend = _f("ml_blend_weight", 0.6)
     blend = max(0.0, min(1.0, blend))
     thresh = max(0.01, min(0.5, _f("ml_rule_disagreement_threshold", 0.12)))

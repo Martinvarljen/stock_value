@@ -37,9 +37,9 @@ from backtesting.yearly_top100_universe import default_universe_cache_dir, load_
 from portfolio.broker import apply_decisions, mark_nav_prices
 from portfolio.decisions import Action, TickerDecision, decide_ticker, prioritize_entries, _quintile_map
 from portfolio.score_pt import score_ticker_at
-from portfolio.backtest_flow_html import write_flow_map_html
-from portfolio.backtest_viz import write_backtest_report
-from portfolio.decision_trace import stage_path_ids, trace_pipeline_stages
+from reporting.backtest_flow_html import write_flow_map_html
+from reporting.backtest_viz import write_backtest_report
+from reporting.decision_trace import stage_path_ids, trace_pipeline_stages
 from portfolio.store import default_state, load_config
 
 

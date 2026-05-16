@@ -45,7 +45,11 @@ from ml_model.features import (
     extract_historical_features,
     MIN_OHLCV_BARS,
 )
-from ml_model.splits import purged_time_series_splits, chronological_holdout_split
+from ml_model.splits import (
+    chronological_holdout_split,
+    grouped_purged_time_series_splits,
+    purged_time_series_splits,
+)
 from ml_model.optuna_tune import tune_lgbm_classifier
 
 MODELS_DIR = Path(__file__).parent / "saved_models"
@@ -195,6 +199,32 @@ def collect_training_data(
     return df
 
 
+def _spy_forward_return_positional(
+    spy_series: pd.Series | None,
+    asof: pd.Timestamp,
+    fwd_idx_date: pd.Timestamp,
+) -> float | None:
+    """SPY total return from the last close on/before ``asof`` to the close
+    on ``fwd_idx_date`` (an actual SPY trading date). When ``fwd_idx_date``
+    isn't in the SPY series, fall back to the next available bar."""
+    if spy_series is None or spy_series.empty:
+        return None
+    try:
+        s_asof = spy_series.loc[:asof]
+        if s_asof.empty:
+            return None
+        spy_now = float(s_asof.iloc[-1])
+        fut = spy_series[spy_series.index >= fwd_idx_date]
+        if fut.empty:
+            return None
+        spy_fut = float(fut.iloc[0])
+        if spy_now == 0:
+            return None
+        return (spy_fut - spy_now) / spy_now
+    except Exception:
+        return None
+
+
 def _build_rows_from_hist(
     ticker: str,
     hist: pd.DataFrame,
@@ -203,33 +233,48 @@ def _build_rows_from_hist(
     label_mode: str,
     spy_series: pd.Series | None,
 ) -> list[dict]:
-    """Shared row builder for yfinance and Dolt OHLCV frames."""
+    """Shared row builder for yfinance and Dolt OHLCV frames.
+
+    Forward labels are anchored on **trading-day positions** in the actual
+    OHLCV frame, not calendar-day deltas. Earlier code did
+    ``date + timedelta(days=int(h * 365 / 252))`` and then took the next
+    available bar — across holiday weeks the realised horizon could drift
+    from ``h`` to ``h+5`` trading days, inflating label noise.
+    """
     max_fwd = int(max(HORIZONS) * 1.5)
     tradeable_dates = hist.index[MIN_OHLCV_BARS:-max_fwd:sample_step]
     if len(tradeable_dates) == 0:
         return []
 
     close = hist["Close"]
+    n_total = len(hist)
     rows: list[dict] = []
     for date in tradeable_dates:
         feat = extract_historical_features(hist, date, spy_series)
         if feat is None:
             continue
-        price_now = float(close.loc[:date].iloc[-1])
+        try:
+            i_now = hist.index.get_loc(date)
+        except KeyError:
+            continue
+        if isinstance(i_now, slice) or hasattr(i_now, "__iter__"):
+            # Duplicate timestamps — take the last one to avoid leakage.
+            i_now = int(np.where(hist.index == date)[0][-1])
+        price_now = float(close.iloc[i_now])
         row = {"ticker": ticker, "date": date}
         row.update(feat)
         valid = True
         for h in HORIZONS:
-            fwd_dt = date + timedelta(days=int(h * 365 / 252))
-            future = hist[hist.index >= fwd_dt]
-            if future.empty:
+            i_fwd = i_now + int(h)
+            if i_fwd >= n_total:
                 valid = False
                 break
-            p_future = float(future["Close"].iloc[0])
+            p_future = float(close.iloc[i_fwd])
             ret = (p_future - price_now) / price_now
             row[f"return_{h}d"] = ret
             if label_mode == "alpha_vs_spy":
-                r_spy = _spy_forward_return(spy_series, date, fwd_dt)
+                fwd_idx_date = hist.index[i_fwd]
+                r_spy = _spy_forward_return_positional(spy_series, date, fwd_idx_date)
                 if r_spy is not None:
                     try:
                         excess = (1.0 + ret) / (1.0 + r_spy) - 1.0
@@ -446,7 +491,16 @@ def train(
         oof_filled = np.zeros(len(X_df), dtype=bool)
 
         if purged_cv:
-            split_iter = purged_time_series_splits(dates, n_splits=5, horizon_days=h)
+            # Prefer the group-aware splitter when a ``ticker`` column is
+            # available — single-name autocorrelation across the gap is the
+            # usual leakage path on cross-sectional panels.
+            if "ticker" in sub.columns:
+                groups = sub["ticker"].reset_index(drop=True)
+                split_iter = grouped_purged_time_series_splits(
+                    dates, groups, n_splits=5, horizon_days=h
+                )
+            else:
+                split_iter = purged_time_series_splits(dates, n_splits=5, horizon_days=h)
         else:
             split_iter = TimeSeriesSplit(n_splits=5).split(X_df)
 
@@ -640,7 +694,7 @@ def main():
 
     if models:
         print(f"\nDone. {len(models)} model(s) trained.")
-        print("Run the dashboard to use them: streamlit run dashboard/app.py")
+        print("Models are now picked up by projection_engine on the next run.")
     else:
         print("Training failed - check errors above.")
 

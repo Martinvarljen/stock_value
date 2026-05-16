@@ -45,9 +45,17 @@ def analyze_ticker(
     margin_of_safety: float = 0.3,
     include_news: bool = False,
     news_days: int = 3,
+    include_explanation: bool = True,
 ) -> dict[str, Any] | None:
-    """Full stack + projections for one symbol."""
-    bundle, err = build_analysis_bundle(ticker, margin_of_safety, include_explanation=False)
+    """Full stack + projections for one symbol.
+
+    ``include_explanation`` defaults to ``True`` because the strategy now embeds
+    the prose explanation into ``DecisionReport.extras["explanation"]`` so the
+    decision memory log captures the rationale alongside each rating.
+    """
+    bundle, err = build_analysis_bundle(
+        ticker, margin_of_safety, include_explanation=include_explanation
+    )
     if bundle is None:
         return {"ticker": ticker.upper(), "error": err, "ok": False}
 
@@ -77,6 +85,11 @@ def analyze_ticker(
     }
     score = ml_score_from_signal(sig)
 
+    explanation = record.get("explanation") or {}
+    tx = record.get("technical_extended") or {}
+    atr_block = tx.get("atr_14") or {}
+    last_bar = tx.get("last_bar") or {}
+
     return {
         "ticker": ticker.upper(),
         "ok": True,
@@ -93,5 +106,15 @@ def analyze_ticker(
         "ml_score": score,
         "expected_return_20d": proj.get("expected_return_20d"),
         "trade_setup": record.get("trade_setup"),
+        "ohlcv_quality": record.get("ohlcv_quality"),
         "critical_flags": record.get("critical_flags") or [],
+        # Risk inputs consumed by the broker for ATR-anchored stops + vol
+        # targeted sizing. None when ``technical_extended`` is unavailable.
+        "atr_pct": atr_block.get("pct_of_price"),
+        "vol_60d_annual": tx.get("realised_vol_60d_annual"),
+        "bar_low": last_bar.get("low"),
+        "bar_high": last_bar.get("high"),
+        "bar_open": last_bar.get("open"),
+        "explanation_one_liner": explanation.get("one_liner"),
+        "explanation_paragraphs": explanation.get("paragraphs"),
     }

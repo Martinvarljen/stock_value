@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 
 
 def _log(msg: str) -> None:
-    """Print that survives Windows stdout quirks inside Streamlit."""
+    """Print helper resilient to Windows stdout encoding quirks."""
     try:
         print(msg, flush=True)
     except OSError:

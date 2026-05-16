@@ -72,6 +72,11 @@ def analyze_extended_technicals(data: dict) -> dict[str, Any]:
     stoch_k = 100.0 * (c - lowest14) / (highest14 - lowest14 + 1e-12)
     stoch_d = stoch_k.rolling(3).mean()
 
+    # ── Realised vol (annualised) — used by broker for vol-targeted sizing ───
+    rets = c.pct_change().dropna()
+    n_vol = min(60, len(rets))
+    rv60 = float(rets.tail(n_vol).std(ddof=1) * math.sqrt(252)) if n_vol >= 20 else None
+
     # ── ADX (14) + DI+/DI- ────────────────────────────────────────────────────
     up_move = h.diff()
     down_move = -l.diff()
@@ -169,6 +174,28 @@ def analyze_extended_technicals(data: dict) -> dict[str, Any]:
             "plus_di": round(_last(plus_di), 1),
             "minus_di": round(_last(minus_di), 1),
             "trend_strength": "strong" if _last(adx) > 25 else "weak",
+        },
+        # ATR(14) absolute and as a % of last price — consumed by the
+        # broker for ATR-anchored stops and vol-aware sizing.
+        "atr_14": {
+            "value": round(_last(atr14), 4),
+            "pct_of_price": round(_last(atr14) / last, 6) if last > 0 else None,
+        },
+        "realised_vol_60d_annual": round(rv60, 6) if rv60 is not None and math.isfinite(rv60) else None,
+        # Last bar OHL — consumed by the broker for intraday-touch stop
+        # fills (otherwise stops record at close even when the day's
+        # range pierced through them, overstating returns on gap days).
+        "last_bar": {
+            # We don't have a separate open series threaded through
+            # ``data`` today, so fall back to prior close as an
+            # approximate open for the gap-detection branch in the
+            # broker. ``high`` / ``low`` come straight from the input
+            # series and are exact — that's what the stop-touch logic
+            # actually needs to anchor the fill.
+            "open": round(float(c.iloc[-2]), 4) if len(c) >= 2 else round(float(c.iloc[-1]), 4),
+            "high": round(float(h.iloc[-1]), 4),
+            "low": round(float(l.iloc[-1]), 4),
+            "close": round(float(c.iloc[-1]), 4),
         },
         "rsi_14": {
             "value": round(rsi_v, 1),

@@ -1,4 +1,30 @@
-"""ML score ranking and quintile diagnostics for backtests."""
+"""ML score ranking and quintile diagnostics for backtests.
+
+Scale-discipline note
+=====================
+Earlier versions returned the first non-null among
+``("ml_score", "p_up_20d", "p_up_60d", "composite_score")``. Those four
+quantities live on **different scales** — the calibrated probabilities are
+in ``[0, 1]`` while ``composite_score`` is in ``[-1, +1]``. Mixing them in a
+single ``assign_quintile`` call meant cross-sectional ranks were sometimes
+comparing scales rather than relative quality.
+
+Quintiles are still rank-based and therefore invariant to monotone
+transforms within a fixed sample, but mixing sources across rows in the
+same sample is *not* invariant: a row with calibrated ``ml_score=0.55``
+and a row with raw ``composite_score=0.55`` should not be ranked identically.
+
+We now expose three explicit selectors:
+
+* ``calibrated_score(sig)`` — calibrated probability only (``ml_score`` then
+  ``p_up_20d`` / ``p_up_60d``). The expected primary input.
+* ``composite_score(sig)`` — fallback for the legacy rule-composite path.
+* ``ml_score_from_signal(sig, prefer="calibrated")`` — convenience wrapper
+  that callers should pass an explicit ``prefer`` to. Default keeps the
+  legacy "first non-null" behaviour for back-compat but emits no implicit
+  scale mixing because the canonical pipeline always sets ``ml_score`` when
+  a calibrated model is present.
+"""
 
 from __future__ import annotations
 
@@ -8,18 +34,61 @@ from datetime import datetime
 import numpy as np
 
 
-def ml_score_from_signal(sig: dict) -> float | None:
-    """Primary cross-sectional score: blended P(up) 20d, else composite."""
-    for key in ("ml_score", "p_up_20d", "p_up_60d", "composite_score"):
-        v = sig.get(key)
-        if v is not None:
-            try:
-                f = float(v)
-                if np.isfinite(f):
-                    return f
-            except (TypeError, ValueError):
-                continue
+_CALIBRATED_KEYS = ("ml_score", "p_up_20d", "p_up_60d")
+_COMPOSITE_KEYS = ("composite_score",)
+
+
+def _first_finite(sig: dict, keys: tuple[str, ...]) -> float | None:
+    for k in keys:
+        v = sig.get(k)
+        if v is None:
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(f):
+            return f
     return None
+
+
+def calibrated_score(sig: dict) -> float | None:
+    """Calibrated probability in [0,1]: ml_score, then p_up_20d / p_up_60d."""
+    return _first_finite(sig, _CALIBRATED_KEYS)
+
+
+def composite_score(sig: dict) -> float | None:
+    """Rule-composite score in [-1, +1]."""
+    return _first_finite(sig, _COMPOSITE_KEYS)
+
+
+def ml_score_from_signal(sig: dict, *, prefer: str = "calibrated") -> float | None:
+    """Pick a single scalar score for cross-sectional ranking.
+
+    ``prefer`` selects which scale the caller intends:
+      * ``"calibrated"`` (default) — use ml_score / p_up_*. Falls back to
+        composite only if no calibrated value is present.
+      * ``"composite"`` — use composite_score directly.
+      * ``"any"`` — legacy first-non-null among (ml, p_up, composite). Use
+        only when you've verified all input rows are on the same scale.
+
+    The recommended pattern is to construct sample groups so every row in a
+    given quintile call shares one scale, then pass ``prefer`` accordingly.
+    """
+    p = prefer.lower()
+    if p == "calibrated":
+        v = calibrated_score(sig)
+        if v is not None:
+            return v
+        return composite_score(sig)
+    if p == "composite":
+        v = composite_score(sig)
+        if v is not None:
+            return v
+        return calibrated_score(sig)
+    if p == "any":
+        return _first_finite(sig, _CALIBRATED_KEYS + _COMPOSITE_KEYS)
+    raise ValueError(f"Unknown prefer={prefer!r}")
 
 
 def assign_quintile(scores: list[float]) -> list[int]:

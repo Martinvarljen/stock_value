@@ -23,11 +23,11 @@ _last_load_error: str | None = None
 
 
 def _ensure_loaded() -> None:
-    """
-    Load or refresh models when metadata.json is new or cache is empty.
+    """Load or refresh models when metadata.json is new or cache is empty.
 
-    Streamlit keeps the process alive across reruns; a failed first load must
-    not permanently block later loads after `trainer.py` writes new files.
+    Long-running processes (the daily agent, batch backtests) keep the
+    predictor cache alive across calls; a failed first load must not block
+    later loads after ``trainer.py`` writes new files.
     """
     global _cache, _calibrators, _meta, _disk_mtime_loaded, _last_load_error
 
@@ -158,7 +158,7 @@ def get_metadata() -> dict | None:
 
 
 def model_summary() -> str:
-    """Human-readable model status for the dashboard."""
+    """Human-readable model status (printed at the top of a daily run)."""
     if not models_available():
         return "No trained models found — using rule-based projections. Run ml_model/trainer.py to train."
     meta = get_metadata() or {}

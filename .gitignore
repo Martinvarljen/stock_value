@@ -7,6 +7,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .venv/
+.venv_bt/
 venv/
 env/
 
@@ -20,7 +21,23 @@ env/
 
 projection/data/cache/*.feather
 backtesting/backtest_run_log.txt
+backtesting/backtest_ml_run_log.txt
 projection/ml_model/saved_models/training_log*.txt
+
+# Strategy run outputs (HTML reports, JSON trade dumps, animated charts)
+portfolio_agent_report_*.html
+portfolio_agent_flow_*.html
+portfolio_agent_trades_*.json
+projection/strategy_dynamic_*_vs_spy_*.html
+strategy_dynamic_*_vs_spy_*.html
+strategy_dynamic_*_trades.html
+strategy_dynamic_*_pipeline.html
+strategy_dynamic_*_trades.json
+market_neutral_ml_*.html
+reports/
+.DS_Store
+backtest_vs_*.html
+backtest_results_*.xlsx
 
 Thumbs.db
 Desktop.ini

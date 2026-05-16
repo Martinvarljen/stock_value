@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from portfolio.backtest_viz import closed_trades_from_ledger
+from reporting.backtest_viz import closed_trades_from_ledger
 
 
 # Fixed pipeline topology (edges used for layout)
