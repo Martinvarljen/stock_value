@@ -14,6 +14,7 @@ from portfolio.exit_policy import (
     min_hold_before_score_exit,
     score_exit_blocked_by_hold,
     short_entry_allowed,
+    short_ticker_entry_allowed,
     short_score_exit_threshold,
     should_cover_short_on_regime,
     take_profit_enabled,
@@ -220,9 +221,13 @@ def decide_ticker(
             base.action = Action.ENTER_LONG
             base.reason = f"P(up)20d={float(p_up):.0%} (small cohort, abs gate)"
             return base
-        if float(p_up) <= max_short - abs_short_buffer and short_entry_allowed(regime, cfg):
+        if (
+            float(p_up) <= max_short - abs_short_buffer
+            and short_entry_allowed(regime, cfg)
+            and short_ticker_entry_allowed(analysis, cfg)
+        ):
             base.action = Action.ENTER_SHORT
-            base.reason = f"P(up)20d={float(p_up):.0%} (small cohort, abs gate, bearish)"
+            base.reason = f"P(up)20d={float(p_up):.0%} (small cohort, strict short)"
             return base
         base.reason = f"P(up)20d={float(p_up):.0%} — small cohort, no entry"
         return base
@@ -238,9 +243,14 @@ def decide_ticker(
             base.reason = f"Q{quintile} P(up)20d={float(p_up):.0%}"
             return base
 
-    if quintile <= q_short and float(p_up) <= max_short and short_entry_allowed(regime, cfg):
+    if (
+        quintile <= q_short
+        and float(p_up) <= max_short
+        and short_entry_allowed(regime, cfg)
+        and short_ticker_entry_allowed(analysis, cfg)
+    ):
         base.action = Action.ENTER_SHORT
-        base.reason = f"Q{quintile} P(up)20d={float(p_up):.0%} (bearish)"
+        base.reason = f"Q{quintile} P(up)20d={float(p_up):.0%} (strict short)"
         return base
 
     base.reason = f"Q{quintile} P(up)20d={float(p_up):.0%} — no entry"
@@ -271,19 +281,23 @@ def decide_universe(
 
 
 def prioritize_entries(decisions: list[TickerDecision], cfg: dict[str, Any]) -> list[TickerDecision]:
-    """Cap new entries per day; prefer higher ml_score."""
-    max_new = int(cfg.get("max_new_entries_per_day", 3))
-    entries = [d for d in decisions if d.action in (Action.ENTER_LONG, Action.ENTER_SHORT)]
-    entries.sort(key=lambda x: (x.ml_score or 0), reverse=True)
-    allowed = {d.ticker for d in entries[:max_new]}
+    """Cap new long/short entries per day (separate budgets for hedges)."""
+    max_long = int(cfg.get("max_new_long_entries_per_day", cfg.get("max_new_entries_per_day", 3)))
+    max_short = int(cfg.get("max_new_short_entries_per_day", 1))
+    longs = [d for d in decisions if d.action == Action.ENTER_LONG]
+    shorts = [d for d in decisions if d.action == Action.ENTER_SHORT]
+    longs.sort(key=lambda x: (x.ml_score or 0), reverse=True)
+    shorts.sort(key=lambda x: (x.ml_score or 1.0))
+    allowed = {d.ticker for d in longs[:max_long]} | {d.ticker for d in shorts[:max_short]}
     out: list[TickerDecision] = []
     for d in decisions:
         if d.action in (Action.ENTER_LONG, Action.ENTER_SHORT) and d.ticker not in allowed:
+            cap = max_short if d.action == Action.ENTER_SHORT else max_long
             out.append(
                 TickerDecision(
                     ticker=d.ticker,
                     action=Action.NO_TRADE,
-                    reason=f"Deferred (daily entry cap {max_new})",
+                    reason=f"Deferred (daily {d.action.value} cap {cap})",
                     ml_score=d.ml_score,
                     quintile=d.quintile,
                     p_up_20d=d.p_up_20d,

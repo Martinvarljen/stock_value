@@ -29,21 +29,25 @@ from portfolio.decision_schema import DecisionReport
 from portfolio.decisions import Action, decide_universe, prioritize_entries
 from portfolio.memory_log import DecisionMemoryLog
 from portfolio.reflection import OutcomeContext, reflect_on_outcome
+from portfolio.ml_gates import apply_ml_entry_gates, evaluate_ml_gates
+from portfolio.market_data import fetch_window
+from portfolio.config_loader import config_fingerprint
 from portfolio.store import (
     DATA_DIR,
     ensure_data_dirs,
     load_config,
     load_state,
     read_daily_notes,
+    run_audit_exists,
     save_state,
     write_daily_notes,
+    write_run_audit,
     write_snapshot,
 )
 from portfolio.trailing_stop import update_open_trailing_stops
 from portfolio.universe import resolve_tickers
 
 import pandas as pd
-import yfinance as yf
 
 
 _DEFAULT_MEMORY_LOG = DATA_DIR / "decision_memory.md"
@@ -55,17 +59,9 @@ def _memory_log_for(cfg: dict) -> DecisionMemoryLog:
     return DecisionMemoryLog(path, max_entries=cap)
 
 
-def _fetch_window(ticker: str, start: str, end: str) -> pd.DataFrame | None:
+def _fetch_window(ticker: str, start: str, end: str, *, use_cache: bool = True) -> pd.DataFrame | None:
     """Daily closes between ``start`` and ``end`` (inclusive). None on failure."""
-    try:
-        df = yf.Ticker(ticker).history(start=start, end=end, interval="1d", auto_adjust=True)
-        if df is None or df.empty or "Close" not in df.columns:
-            return None
-        if getattr(df.index, "tz", None) is not None:
-            df.index = df.index.tz_localize(None)
-        return df.sort_index()
-    except Exception:
-        return None
+    return fetch_window(ticker, start, end, use_cache=use_cache)
 
 
 def _resolve_pending_entries(
@@ -102,13 +98,13 @@ def _resolve_pending_entries(
             continue
 
         start = entry_dt.isoformat()
-        stock = _fetch_window(e.ticker, start, end)
+        stock = _fetch_window(e.ticker, start, end, use_cache=use_cache)
         if stock is None or len(stock) < 2:
             continue
 
         bench = spy_cache.get(start)
         if bench is None:
-            bench = _fetch_window(benchmark, start, end)
+            bench = _fetch_window(benchmark, start, end, use_cache=use_cache)
             if bench is not None:
                 spy_cache[start] = bench
         if bench is None or len(bench) < 2:
@@ -219,11 +215,21 @@ def run_daily(
     max_tickers: int | None,
     universe: str,
     include_news: bool | None,
+    force: bool = False,
+    profile: str | None = None,
 ) -> None:
     ensure_data_dirs()
-    cfg = load_config()
+    cfg = load_config(profile=profile)
     state = load_state(cfg)
     run_date = date.today()
+    daily_cfg = cfg.get("daily_run") or {}
+    if daily_cfg.get("reject_duplicate_run", True) and run_audit_exists(run_date) and not force:
+        raise SystemExit(
+            f"Run audit already exists for {run_date.isoformat()}: "
+            f"portfolio/data/runs/{run_date.isoformat()}.json\n"
+            "Pass --force to run again."
+        )
+    use_cache = bool(daily_cfg.get("use_ohlcv_cache", True))
 
     yesterday_notes = read_daily_notes(run_date)
     if yesterday_notes:
@@ -288,6 +294,7 @@ def run_daily(
     # surface "we wanted to but the limits said no".
     from portfolio.risk_limits import RiskLimits, apply_pre_trade_limits
     _limits_cfg = cfg_run.get("risk_limits") or {}
+    dropped_by_limits: list[dict] = []
     if _limits_cfg.get("enabled", True):
         limits = RiskLimits.from_cfg(_limits_cfg)
         analyses_by_tk = {a["ticker"].upper(): a for a in analyses if a.get("ok")}
@@ -302,7 +309,18 @@ def run_daily(
             for d in dropped_by_limits[:5]:
                 print(f"  - {d['ticker']}: {d['reason']}")
 
+    ml_gate = evaluate_ml_gates(cfg, analyses)
+    if ml_gate.reasons:
+        print("ML gates:")
+        for r in ml_gate.reasons:
+            print(f"  • {r}")
+    decisions, blocked_ml = apply_ml_entry_gates(decisions, ml_gate)
+    if blocked_ml:
+        print(f"ML gates blocked {len(blocked_ml)} new entr(y/ies).")
+
+    nav_before = state.nav
     ledger_rows = apply_decisions(state, decisions, run_date=run_date, cfg=cfg_run)
+    state.last_run_date = run_date.isoformat()
     save_state(state)
 
     analyses_by_ticker = {a["ticker"].upper(): a for a in analyses if a.get("ok")}
@@ -373,6 +391,25 @@ def run_daily(
     }
     snap_path = write_snapshot(run_date, snap)
 
+    audit = {
+        "run_date": run_date.isoformat(),
+        "forced": force,
+        "config_fingerprint": config_fingerprint(cfg),
+        "universe": universe,
+        "symbols_scanned": len(symbols),
+        "analyses_ok": sum(1 for a in analyses if a.get("ok")),
+        "ohlcv_dropped": [{"ticker": t, "errors": e} for t, e in dropped_ohlcv],
+        "risk_limit_drops": dropped_by_limits if _limits_cfg.get("enabled", True) else [],
+        "ml_gates": ml_gate.to_dict(),
+        "ml_blocked_entries": blocked_ml,
+        "regime": regime,
+        "nav_before": nav_before,
+        "nav_after": state.nav,
+        "decisions": snap["decisions"],
+        "ledger_count": len(ledger_rows),
+    }
+    audit_path = write_run_audit(run_date, audit)
+
     print("\n--- Decisions ---")
     for d in sorted(decisions, key=lambda x: (x.action.value, x.ticker)):
         if d.action == Action.NO_TRADE:
@@ -383,6 +420,7 @@ def run_daily(
     print(f"\nNAV {state.nav:.4f} | cash {state.cash:.4f} | positions {len(state.positions)}")
     print(f"Notes for tomorrow → {notes_path}")
     print(f"Snapshot → {snap_path}")
+    print(f"Run audit → {audit_path}")
     print("\nWeekly report: python reporting/weekly_report.py")
 
 
@@ -393,9 +431,20 @@ def main() -> None:
     ap.add_argument("--universe", default=None, help="top100 (default from config)")
     ap.add_argument("--news", action="store_true", help="Include FinBERT/Claude news pass")
     ap.add_argument("--no-news", action="store_true", help="Skip news even if config enables it")
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow a second run on the same calendar day (overwrites run audit)",
+    )
+    ap.add_argument(
+        "--profile",
+        choices=("research", "conservative", "research_ls"),
+        default=None,
+        help="Config overlay: research (5x long), research_ls (5x long+short), conservative (1x)",
+    )
     args = ap.parse_args()
 
-    cfg = load_config()
+    cfg = load_config(profile=args.profile)
     universe = args.universe or cfg.get("universe", "top100")
     include_news = None
     if args.news:
@@ -409,6 +458,8 @@ def main() -> None:
         max_tickers=max_t,
         universe=universe,
         include_news=include_news,
+        force=args.force,
+        profile=args.profile,
     )
 
 

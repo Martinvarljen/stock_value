@@ -75,11 +75,11 @@ def long_entry_allowed(regime: dict[str, Any], cfg: dict[str, Any], scale: float
 
 def short_entry_allowed(regime: dict[str, Any], cfg: dict[str, Any]) -> bool:
     """
-    Short only in confirmed bear (SPY below 200d MA).
+    Short only when macro filters pass (confirmed bear + optional stress gates).
 
-    The old ``scale < 1.0`` gate allowed shorts when ``gross_exposure_scale`` was
-    ``bear_scale`` (0.35) during *unknown* history while ``spy_bull`` still
-    defaulted True — a common source of shorts in 2019 that then lost.
+    Stricter mode (``research_ls`` profile) requires full risk-off sizing,
+    SPY sufficiently below the 200d MA, and negative SPY 20d momentum so
+    shorts are hedges in real drawdowns, not early bear probes.
     """
     if not cfg.get("enable_short", True):
         return False
@@ -90,6 +90,39 @@ def short_entry_allowed(regime: dict[str, Any], cfg: dict[str, Any]) -> bool:
         scale = float(regime.get("gross_exposure_scale", 1.0))
         if scale >= float(cfg.get("short_entry_max_regime_scale", 0.99)):
             return False
+
+    if cfg.get("short_requires_full_risk_off", False):
+        bear_scale = float(cfg.get("bear_scale", 0.35))
+        scale = float(regime.get("gross_exposure_scale", 1.0))
+        if scale > bear_scale + 0.01:
+            return False
+
+    min_below = cfg.get("short_min_spy_below_ma_pct")
+    if min_below is not None:
+        below = regime.get("spy_pct_below_ma200")
+        if below is None or float(below) < float(min_below):
+            return False
+
+    max_spy_ret = cfg.get("short_max_spy_return_20d")
+    if max_spy_ret is not None:
+        spy_ret = regime.get("spy_return_20d")
+        if spy_ret is None or float(spy_ret) > float(max_spy_ret):
+            return False
+
+    return True
+
+
+def short_ticker_entry_allowed(analysis: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    """Per-name short gate after macro ``short_entry_allowed`` passes."""
+    p_up = analysis.get("p_up_20d")
+    if p_up is None:
+        return False
+    ceiling = float(cfg.get("max_p_up_short", 0.38))
+    if float(p_up) > ceiling:
+        return False
+    floor = cfg.get("short_min_p_up_floor")
+    if floor is not None and float(p_up) < float(floor):
+        return False
     return True
 
 

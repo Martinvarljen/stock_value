@@ -27,3 +27,4 @@ Desktop.ini
 
 # Paper agent runtime (config.json is tracked)
 portfolio/data/
+portfolio/config.frozen.json

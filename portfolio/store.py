@@ -17,17 +17,40 @@ LEDGER_PATH = DATA_DIR / "trade_ledger.jsonl"
 NOTES_DIR = DATA_DIR / "daily_notes"
 SNAPSHOTS_DIR = DATA_DIR / "daily_snapshots"
 WEEKLY_DIR = DATA_DIR / "weekly"
+RUNS_DIR = DATA_DIR / "runs"
 
 
 def ensure_data_dirs() -> None:
-    for d in (DATA_DIR, NOTES_DIR, SNAPSHOTS_DIR, WEEKLY_DIR):
+    for d in (DATA_DIR, NOTES_DIR, SNAPSHOTS_DIR, WEEKLY_DIR, RUNS_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
-def load_config() -> dict[str, Any]:
-    if CONFIG_PATH.is_file():
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    return {}
+def load_config(profile: str | None = None) -> dict[str, Any]:
+    from portfolio.config_loader import load_config as _load_config
+
+    return _load_config(profile=profile)
+
+
+def run_audit_path(run_date: date) -> Path:
+    return RUNS_DIR / f"{run_date.isoformat()}.json"
+
+
+def run_audit_exists(run_date: date) -> bool:
+    return run_audit_path(run_date).is_file()
+
+
+def write_run_audit(run_date: date, payload: dict[str, Any]) -> Path:
+    ensure_data_dirs()
+    path = run_audit_path(run_date)
+    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    return path
+
+
+def read_run_audit(run_date: date) -> dict[str, Any] | None:
+    path = run_audit_path(run_date)
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _today() -> date:

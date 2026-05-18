@@ -159,6 +159,30 @@ class TestExitPolicy(unittest.TestCase):
         self.assertFalse(short_entry_allowed({"regime_signal": "unknown"}, cfg))
         self.assertTrue(short_entry_allowed({"regime_signal": "bear"}, cfg))
 
+    def test_strict_short_requires_stress(self) -> None:
+        cfg = {
+            "enable_short": True,
+            "short_entry_requires_bear_regime": True,
+            "short_requires_full_risk_off": True,
+            "bear_scale": 0.35,
+            "short_min_spy_below_ma_pct": 0.02,
+            "short_max_spy_return_20d": -0.04,
+        }
+        weak = {
+            "regime_signal": "bear",
+            "gross_exposure_scale": 0.35,
+            "spy_pct_below_ma200": 0.01,
+            "spy_return_20d": -0.02,
+        }
+        self.assertFalse(short_entry_allowed(weak, cfg))
+        strong = {
+            "regime_signal": "bear",
+            "gross_exposure_scale": 0.35,
+            "spy_pct_below_ma200": 0.03,
+            "spy_return_20d": -0.06,
+        }
+        self.assertTrue(short_entry_allowed(strong, cfg))
+
     def test_short_cover_threshold_tied_to_entry(self) -> None:
         pos = SimpleNamespace(p_up_20d_at_entry=0.35)
         cfg = {

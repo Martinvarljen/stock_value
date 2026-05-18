@@ -219,9 +219,10 @@ def apply_pre_trade_limits(
         if not side_long:
             entry_frac *= float(cfg.get("short_position_frac_mult", 1.0))
         margin = max(0.0, entry_frac * state.nav)
-        from portfolio.broker import cfd_leverage
+        from portfolio.broker import leg_leverage
 
-        lev = cfd_leverage(cfg)
+        side_label = "long" if side_long else "short"
+        lev = leg_leverage(cfg, side_label)
         exposure_add = margin * lev
         cash_need = margin
         if margin <= 0 or state.cash < cash_need * 0.999:

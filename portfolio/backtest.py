@@ -23,6 +23,7 @@ import sys
 from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import yfinance as yf
@@ -32,7 +33,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import backtesting.strategy_backtest as st
-from backtesting.regime import gross_exposure_scale, regime_signal, spy_bull_regime, spy_close_series
+from backtesting.regime import build_regime_snapshot, spy_close_series
 from backtesting.yearly_top100_universe import default_universe_cache_dir, load_universe_map_for_lag_years
 from portfolio.broker import apply_decisions, mark_nav_prices
 from portfolio.decisions import Action, TickerDecision, decide_ticker, prioritize_entries, _quintile_map
@@ -40,9 +41,12 @@ from portfolio.score_pt import score_ticker_at
 from reporting.backtest_flow_html import write_flow_map_html
 from reporting.backtest_viz import write_backtest_report
 from reporting.decision_trace import stage_path_ids, trace_pipeline_stages
+from portfolio.backtest_invariants import _gross_exposure_pct, validate_backtest_run
+from portfolio.config_loader import config_fingerprint
 from portfolio.store import default_state, load_config
 from portfolio.exit_policy import take_profit_enabled
 from portfolio.trailing_stop import stop_exit_label, update_open_trailing_stops
+from portfolio.universe_meta import universe_summary
 
 
 def _norm_day(ts) -> datetime:
@@ -136,9 +140,20 @@ def _intraday_exit_decisions(
     return out
 
 
-def _universe_for_day(uni: dict[int, list[str]], d: date) -> set[str]:
+def _universe_for_day(
+    uni: dict[int, list[str]],
+    d: date,
+    *,
+    universe_source: str = "legacy",
+) -> set[str]:
     ly = d.year - 1
-    return {t.upper() for t in uni.get(ly, [])}
+    tickers = {t.upper() for t in uni.get(ly, [])}
+    if universe_source in ("pit", "pit_filter"):
+        from backtesting.sp500_pit_universe import members_as_of
+
+        pit = members_as_of(d)
+        tickers = {t for t in tickers if t in pit}
+    return tickers
 
 
 def _cagr(start: float, end: float, years: float) -> float | None:
@@ -169,8 +184,25 @@ def run_backtest(
     out_json: Path | None = None,
     out_flow_html: Path | None = None,
     initial_capital: float | None = None,
+    profile: str | None = None,
+    universe_source: str | None = None,
+    frozen_config_path: Path | None = None,
+    skip_invariants: bool = False,
 ) -> dict:
-    cfg = load_config()
+    if frozen_config_path and frozen_config_path.is_file():
+        import json as _json
+
+        cfg = _json.loads(frozen_config_path.read_text(encoding="utf-8"))
+        cfg["_frozen_config"] = str(frozen_config_path)
+    else:
+        defaults = (load_config().get("backtest_defaults") or {})
+        prof = profile or defaults.get("profile")
+        cfg = load_config(profile=prof)
+    uni_src = (
+        universe_source
+        or cfg.get("backtest_defaults", {}).get("universe_source")
+        or "legacy"
+    )
     to_year = to_year or datetime.today().year
     start = date(from_year, 1, 15)
     end = date(to_year, 12, 15)
@@ -194,7 +226,14 @@ def run_backtest(
     if max_tickers and max_tickers > 0:
         all_tickers = all_tickers[:max_tickers]
 
-    print(f"\nAgent backtest {start} → {end} | {len(all_tickers)} tickers | signal every {signal_step}d\n")
+    prof_label = cfg.get("profile", "default")
+    lev_long = cfg.get("long_leverage", cfg.get("cfd_leverage", 1))
+    lev_short = cfg.get("short_leverage", cfg.get("cfd_leverage", lev_long))
+    print(
+        f"\nAgent backtest {start} → {end} | profile={prof_label} | "
+        f"leverage long={lev_long}x short={lev_short}x | universe={uni_src} | "
+        f"{len(all_tickers)} tickers | signal every {signal_step}d\n"
+    )
 
     spy_hist = yf.Ticker("SPY").history(period="max", interval="1d")
     spy_close = spy_close_series(spy_hist)
@@ -225,11 +264,16 @@ def run_backtest(
     ledger: list[dict] = []
     snapshots: list[dict] = []
     traces: list[dict] = []
+    run_stats: dict[str, Any] = {
+        "risk_limit_drops": 0,
+        "max_gross_exposure": 0.0,
+        "max_positions": 0,
+    }
 
     for di, dt in enumerate(trading_days):
         d = dt.date()
         refresh = di % max(1, signal_step) == 0
-        allowed = _universe_for_day(uni, d) | state.open_tickers()
+        allowed = _universe_for_day(uni, d, universe_source=uni_src) | state.open_tickers()
 
         if refresh:
             as_of = dt
@@ -256,11 +300,9 @@ def run_backtest(
             else:
                 qmap = {}
 
-        regime = {
-            "spy_bull": spy_bull_regime(spy_close, dt),
-            "regime_signal": regime_signal(spy_close, dt),
-            "gross_exposure_scale": gross_exposure_scale(spy_close, dt, bear_scale=float(cfg.get("bear_scale", 0.35))),
-        }
+        regime = build_regime_snapshot(
+            spy_close, dt, bear_scale=float(cfg.get("bear_scale", 0.35)),
+        )
         cfg_run = {**cfg, "_regime_scale": regime["gross_exposure_scale"]}
 
         scan = allowed | state.open_tickers()
@@ -329,7 +371,7 @@ def run_backtest(
         if limits_cfg.get("enabled", True):
             limits = RiskLimits.from_cfg(limits_cfg)
             by_tk = {a["ticker"].upper(): a for a in analyses if a.get("ok")}
-            decisions, _dropped = apply_pre_trade_limits(
+            decisions, dropped_limits = apply_pre_trade_limits(
                 decisions,
                 state,
                 limits=limits,
@@ -338,6 +380,7 @@ def run_backtest(
                 beta_lookup=lambda tk: (by_tk.get(tk.upper(), {}) or {}).get("beta"),
                 vol_lookup=lambda tk: (by_tk.get(tk.upper(), {}) or {}).get("vol_60d_annual"),
             )
+            run_stats["risk_limit_drops"] += len(dropped_limits)
 
         day_rows = apply_decisions(state, decisions, run_date=d, cfg=cfg_run, write_ledger=False)
         ledger.extend(day_rows)
@@ -384,6 +427,9 @@ def run_backtest(
             )
 
         mark_nav_prices(state, closes)
+        gross = _gross_exposure_pct(state, cfg_run)
+        run_stats["max_gross_exposure"] = max(run_stats["max_gross_exposure"], gross)
+        run_stats["max_positions"] = max(run_stats["max_positions"], len(state.positions))
         pos_snap = []
         for p in state.positions:
             px = closes.get(p.ticker.upper(), p.entry_price)
@@ -427,6 +473,11 @@ def run_backtest(
         "years": round(years, 2),
         "tickers": len(raw_by),
         "signal_step_days": signal_step,
+        "profile": cfg.get("profile", "default"),
+        "cfd_leverage": cfg.get("cfd_leverage"),
+        "long_leverage": cfg.get("long_leverage", cfg.get("cfd_leverage")),
+        "short_leverage": cfg.get("short_leverage", cfg.get("cfd_leverage")),
+        "config_fingerprint": config_fingerprint(cfg),
         "strategy_cagr": cagr_s,
         "spy_cagr": cagr_b,
         "strategy_max_dd": mdd_s,
@@ -439,7 +490,23 @@ def run_backtest(
         "final_spy_usd": (b1 * cap) if cap else None,
         "strategy_total_return": (s1 / s0 - 1.0) if s0 > 0 else None,
         "spy_total_return": (b1 / b0 - 1.0) if b0 > 0 else None,
+        "run_stats": run_stats,
     }
+    summary.update(universe_summary(universe_source=uni_src, start=start, end=end))
+
+    invariant_errors = validate_backtest_run(
+        curve=df,
+        ledger=ledger,
+        snapshots=snapshots,
+        cfg=cfg,
+        stats={**run_stats, "strategy_max_dd": mdd_s},
+    )
+    summary["invariants_ok"] = len(invariant_errors) == 0
+    summary["invariant_errors"] = invariant_errors
+    if invariant_errors and not skip_invariants:
+        print("\n⚠ Invariant violations:")
+        for err in invariant_errors:
+            print(f"  - {err}")
 
     print("\n=== Agent backtest summary ===")
     print(f"  Period:        {start} → {end} ({years:.1f} y)")
@@ -480,6 +547,18 @@ def run_backtest(
     return summary
 
 
+def _print_profile_comparison(rows: list[dict]) -> None:
+    print("\n=== Profile comparison ===")
+    for r in rows:
+        cagr = r.get("strategy_cagr")
+        cagr_s = f"{cagr:.1%}" if cagr is not None else "n/a"
+        print(
+            f"  {r.get('profile', '?'):12}  leverage={r.get('cfd_leverage')}x  "
+            f"CAGR={cagr_s}  maxDD={r.get('strategy_max_dd', 0):.1%}  "
+            f"final_NAV={r.get('final_nav', 0):.4f}"
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Backtest portfolio daily agent vs SPY.")
     ap.add_argument("--from-year", type=int, default=2015)
@@ -494,22 +573,65 @@ def main() -> None:
         default=None,
         help="Scale report to dollar portfolio (e.g. 10000 for $10k start)",
     )
+    ap.add_argument(
+        "--profile",
+        choices=("research", "conservative", "research_ls"),
+        default=None,
+        help="Leverage profile: research (5x long), research_ls (5x long+short), conservative (1x)",
+    )
+    ap.add_argument(
+        "--compare-profiles",
+        action="store_true",
+        help="Run research (5x) and conservative (1x) back-to-back and print comparison",
+    )
+    ap.add_argument(
+        "--universe-source",
+        choices=("legacy", "pit", "pit_filter"),
+        default=None,
+        help="legacy=yearly top-100; pit*=filter to S&P members as-of each day",
+    )
+    ap.add_argument(
+        "--frozen-config",
+        type=Path,
+        default=None,
+        help="JSON file with locked thresholds for OOS runs (see config.frozen.example.json)",
+    )
+    ap.add_argument("--skip-invariants", action="store_true", help="Do not fail loudly on invariant violations")
     args = ap.parse_args()
 
     stamp = datetime.today().strftime("%Y%m%d")
-    out = args.out_html or (_ROOT / f"portfolio_agent_report_{stamp}.html")
-    out_json = args.out_json or (_ROOT / f"portfolio_agent_trades_{stamp}.json")
-    out_flow = _ROOT / f"portfolio_agent_flow_{stamp}.html"
-    run_backtest(
-        from_year=args.from_year,
-        to_year=args.to_year,
-        max_tickers=args.max_tickers if args.max_tickers > 0 else None,
-        signal_step=max(1, args.signal_step),
-        out_html=out,
-        out_json=out_json,
-        out_flow_html=out_flow,
-        initial_capital=args.initial_capital,
-    )
+    profiles = ("research", "conservative") if args.compare_profiles else (args.profile,)
+    summaries: list[dict] = []
+
+    for i, prof in enumerate(profiles):
+        suffix = f"_{prof}" if args.compare_profiles else ""
+        out = args.out_html or (_ROOT / f"portfolio_agent_report_{stamp}{suffix}.html")
+        if args.compare_profiles and args.out_html:
+            out = args.out_html.with_stem(f"{args.out_html.stem}_{prof}")
+        out_json = args.out_json or (_ROOT / f"portfolio_agent_trades_{stamp}{suffix}.json")
+        if args.compare_profiles and args.out_json:
+            out_json = args.out_json.with_stem(f"{args.out_json.stem}_{prof}")
+        out_flow = _ROOT / f"portfolio_agent_flow_{stamp}{suffix}.html"
+        if args.compare_profiles and i > 0:
+            out_flow = None
+        summary = run_backtest(
+            from_year=args.from_year,
+            to_year=args.to_year,
+            max_tickers=args.max_tickers if args.max_tickers > 0 else None,
+            signal_step=max(1, args.signal_step),
+            out_html=out if (i == 0 or args.compare_profiles) else None,
+            out_json=out_json if (i == 0 or args.compare_profiles) else None,
+            out_flow_html=out_flow if i == 0 else None,
+            initial_capital=args.initial_capital,
+            profile=prof,
+            universe_source=args.universe_source,
+            frozen_config_path=args.frozen_config,
+            skip_invariants=args.skip_invariants,
+        )
+        summaries.append(summary)
+
+    if args.compare_profiles and len(summaries) > 1:
+        _print_profile_comparison(summaries)
 
 
 if __name__ == "__main__":

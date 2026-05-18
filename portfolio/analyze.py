@@ -16,7 +16,7 @@ from pipeline import build_analysis_bundle
 from projection_engine import generate_projections
 
 from backtesting.ml_quant import ml_score_from_signal
-from backtesting.regime import gross_exposure_scale, regime_signal, spy_bull_regime, spy_close_series
+from backtesting.regime import build_regime_snapshot, spy_close_series
 
 import pandas as pd
 import yfinance as yf
@@ -30,15 +30,8 @@ def load_spy_close() -> pd.Series:
 def market_regime(as_of: datetime | None = None) -> dict[str, Any]:
     as_of = as_of or datetime.today()
     spy = load_spy_close()
-    bull = spy_bull_regime(spy, as_of)
-    scale = gross_exposure_scale(spy, as_of)
-    sig = regime_signal(spy, as_of)
-    return {
-        "as_of": as_of.date().isoformat(),
-        "spy_bull": bull,
-        "regime_signal": sig,
-        "gross_exposure_scale": scale,
-    }
+    snap = build_regime_snapshot(spy, as_of)
+    return {"as_of": as_of.date().isoformat(), **snap}
 
 
 def analyze_ticker(

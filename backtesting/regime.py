@@ -75,6 +75,64 @@ def regime_signal(
     return "bull" if spy_bull_regime(spy_close, as_of, ma_days=ma_days) else "bear"
 
 
+def spy_pct_below_ma(
+    spy_close: pd.Series,
+    as_of: datetime,
+    *,
+    ma_days: int = 200,
+) -> float | None:
+    """Fraction SPY is below its MA (0 = at MA, 0.05 = 5% below). None if unknown."""
+    if not _has_enough_history(spy_close, as_of, ma_days):
+        return None
+    ts = pd.Timestamp(as_of)
+    sub = spy_close[spy_close.index <= ts]
+    px = float(sub.iloc[-1])
+    ma = float(sub.iloc[-ma_days:].mean())
+    if ma <= 0:
+        return None
+    return max(0.0, (ma - px) / ma)
+
+
+def spy_trailing_return(
+    spy_close: pd.Series,
+    as_of: datetime,
+    *,
+    days: int = 20,
+) -> float | None:
+    """Simple trailing return over ``days`` bars ending at ``as_of``."""
+    if spy_close is None or spy_close.empty or days < 1:
+        return None
+    ts = pd.Timestamp(as_of)
+    sub = spy_close[spy_close.index <= ts]
+    if len(sub) < days + 1:
+        return None
+    p0 = float(sub.iloc[-(days + 1)])
+    p1 = float(sub.iloc[-1])
+    if p0 <= 0:
+        return None
+    return p1 / p0 - 1.0
+
+
+def build_regime_snapshot(
+    spy_close: pd.Series,
+    as_of: datetime,
+    *,
+    ma_days: int = 200,
+    bear_scale: float = 0.35,
+    momentum_days: int = 20,
+) -> dict[str, object]:
+    """Regime dict for portfolio decisions (bull/bear + short-gate features)."""
+    return {
+        "spy_bull": spy_bull_regime(spy_close, as_of, ma_days=ma_days),
+        "regime_signal": regime_signal(spy_close, as_of, ma_days=ma_days),
+        "gross_exposure_scale": gross_exposure_scale(
+            spy_close, as_of, ma_days=ma_days, bear_scale=bear_scale,
+        ),
+        "spy_pct_below_ma200": spy_pct_below_ma(spy_close, as_of, ma_days=ma_days),
+        "spy_return_20d": spy_trailing_return(spy_close, as_of, days=momentum_days),
+    }
+
+
 def gross_exposure_scale(
     spy_close: pd.Series,
     as_of: datetime,

@@ -59,5 +59,24 @@
     "max_sector_pct": 0.30,
     "max_beta_to_spy": 1.15,
     "max_single_day_var_pct": 0.06
+  },
+  "ml_gates": {
+    "enabled": true,
+    "block_entries_on_high_feature_drift": true,
+    "block_entries_on_calibration_drift": true,
+    "drift_severity_threshold": "high",
+    "warn_if_missing_baseline": true,
+    "feature_baseline_path": "projection/ml_model/saved_models/feature_baseline.json",
+    "calibration_log_path": "projection/ml_model/saved_models/calibration_log.jsonl",
+    "calibration_rolling_n": 5,
+    "calibration_z_threshold": 2.0
+  },
+  "backtest_defaults": {
+    "profile": "research",
+    "universe_source": "legacy"
+  },
+  "daily_run": {
+    "use_ohlcv_cache": true,
+    "reject_duplicate_run": true
   }
 }

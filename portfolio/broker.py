@@ -3,7 +3,7 @@
 Cost model (T212-style CFD)
 ---------------------------
 * **Margin** = cash reserved per slot (~``position_frac`` × NAV).
-* **Exposure** = margin × ``cfd_leverage`` (default 5×) for **both** long and short.
+* **Exposure** = margin × per-side leverage (``long_leverage`` / ``short_leverage``, or ``cfd_leverage`` fallback).
 * P&L scales on **exposure**; stops/TP are on the underlying price move.
 * Per-leg ``commission_bps`` + ``slippage_bps``.
 * **Overnight interest** on **long and short** exposure (``overnight_interest_bps_annual``),
@@ -25,11 +25,21 @@ from portfolio.trailing_stop import seed_trail_fields, stop_exit_label
 
 
 def cfd_leverage(cfg: dict[str, Any]) -> float:
-    """Leverage for long and short CFD legs (``1`` = cash fully funded)."""
-    for key in ("cfd_leverage", "short_leverage", "long_leverage"):
-        if key in cfg and cfg[key] is not None:
-            return max(1.0, float(cfg[key]))
+    """Legacy single leverage (prefer ``leg_leverage`` for per-side sizing)."""
+    if cfg.get("cfd_leverage") is not None:
+        return max(1.0, float(cfg["cfd_leverage"]))
+    if cfg.get("long_leverage") is not None:
+        return max(1.0, float(cfg["long_leverage"]))
     return 1.0
+
+
+def leg_leverage(cfg: dict[str, Any], side: str) -> float:
+    """Per-side leverage: shorts can use lower ``short_leverage`` than longs."""
+    if side == "short" and cfg.get("short_leverage") is not None:
+        return max(1.0, float(cfg["short_leverage"]))
+    if side == "long" and cfg.get("long_leverage") is not None:
+        return max(1.0, float(cfg["long_leverage"]))
+    return cfd_leverage(cfg)
 
 
 def _cost_params(cfg: dict[str, Any]) -> tuple[float, float]:
@@ -138,15 +148,15 @@ def apply_decisions(
     """Mutate state; return ledger rows written today."""
     frac = float(cfg.get("position_frac", 0.1))
     max_pos = int(cfg.get("max_positions", 10))
-    stop_pct = float(cfg.get("stop_loss_pct", 0.20))
+    stop_pct_long = float(cfg.get("stop_loss_pct", 0.20))
     tp_pct = float(cfg.get("take_profit_pct", 0.40))
-    max_hold = int(cfg.get("max_hold_days", 25))
+    max_hold_long = int(cfg.get("max_hold_days", 25))
+    max_short_pos = int(cfg.get("max_short_positions", cfg.get("max_positions", 10)))
     scale = float(cfg.get("_regime_scale", 1.0))
     eff_frac = frac * scale
     if scale >= float(cfg.get("bull_scale_threshold", 0.99)):
         eff_frac *= float(cfg.get("bull_position_frac_mult", 1.0))
     cost_one_way, _ = _cost_params(cfg)
-    lev = cfd_leverage(cfg)
 
     atr_stop_mult = float(cfg.get("atr_stop_mult", 0.0))
     atr_tp_mult = float(cfg.get("atr_tp_mult", 0.0))
@@ -207,6 +217,7 @@ def apply_decisions(
         exit_cost = gross_proceeds * cost_one_way
         net_proceeds = gross_proceeds - exit_cost
         state.cash += net_proceeds
+        exit_lev = leg_leverage(cfg, pos.side)
         row = {
             "date": run_s,
             "ticker": d.ticker,
@@ -222,7 +233,8 @@ def apply_decisions(
             "exit_cost": round(exit_cost, 6),
             "net_proceeds": round(net_proceeds, 6),
             "days_held": held,
-            "cfd_leverage": lev,
+            "leg_leverage": exit_lev,
+            "cfd_leverage": exit_lev,
             "reason": d.reason,
         }
         if write_ledger:
@@ -238,7 +250,21 @@ def apply_decisions(
         if len(state.positions) >= max_pos:
             continue
         side = "long" if d.action == Action.ENTER_LONG else "short"
+        n_short = sum(1 for p in state.positions if p.side == "short")
+        if side == "short" and n_short >= max_short_pos:
+            continue
         per_position_frac = frac * scale
+        lev = leg_leverage(cfg, side)
+        stop_pct = float(
+            cfg.get("short_stop_loss_pct", stop_pct_long)
+            if side == "short"
+            else stop_pct_long
+        )
+        max_hold = int(
+            cfg.get("short_max_hold_days", max_hold_long)
+            if side == "short"
+            else max_hold_long
+        )
         if scale >= float(cfg.get("bull_scale_threshold", 0.99)):
             per_position_frac *= float(cfg.get("bull_position_frac_mult", 1.0))
         if side == "short":
@@ -308,6 +334,7 @@ def apply_decisions(
             "notional": round(exposure, 6),
             "entry_cost": round(entry_cost, 6),
             "budget_pre_cost": round(budget, 6),
+            "leg_leverage": lev,
             "cfd_leverage": lev,
             "reason": d.reason,
             "p_up_20d": d.p_up_20d,

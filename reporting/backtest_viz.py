@@ -305,6 +305,37 @@ def write_backtest_report(
     cagr_b = summary.get("spy_cagr")
     cagr_s_s = f"{cagr_s:.1%}" if cagr_s is not None else "n/a"
     cagr_b_s = f"{cagr_b:.1%}" if cagr_b is not None else "n/a"
+    uni_block = ""
+    pit_warn = summary.get("pit_warning")
+    if summary.get("universe_source") or pit_warn or summary.get("survivorship_bias_note"):
+        uni_block = (
+            f"<br><b>Universe</b>: {summary.get('universe_source', 'legacy')} — "
+            f"{summary.get('universe_description', '')}"
+        )
+        if pit_warn:
+            uni_block += f"<br><span style='color:#f39c12'>⚠ {pit_warn}</span>"
+        note = summary.get("survivorship_bias_note")
+        if note:
+            uni_block += f"<br><span style='color:#aaa;font-size:12px'>{note}</span>"
+    prof_block = ""
+    if summary.get("profile"):
+        lev_l = summary.get("long_leverage", summary.get("cfd_leverage"))
+        lev_s = summary.get("short_leverage", summary.get("cfd_leverage"))
+        prof_block = (
+            f"<br>Profile: <b>{summary.get('profile')}</b> &nbsp;|&nbsp; "
+            f"Leverage: long <b>{lev_l}x</b> / short <b>{lev_s}x</b> &nbsp;|&nbsp; "
+            f"Config hash: <code>{summary.get('config_fingerprint', '—')}</code>"
+        )
+    inv_block = ""
+    if summary.get("invariant_errors"):
+        inv_block = (
+            "<br><span style='color:#e74c3c'>Invariant issues: "
+            + "; ".join(summary["invariant_errors"][:3])
+            + "</span>"
+        )
+    elif summary.get("invariants_ok"):
+        inv_block = "<br><span style='color:#2ecc71'>Invariants: OK</span>"
+
     cap_block = ""
     if dollar_mode:
         fs = summary.get("final_strategy_usd")
@@ -336,7 +367,7 @@ def write_backtest_report(
   Strategy CAGR: {cagr_s_s} &nbsp;|&nbsp; SPY: {cagr_b_s}<br>
   Max DD: strategy {summary.get('strategy_max_dd', 0):.1%} &nbsp;|&nbsp; SPY {summary.get('spy_max_dd', 0):.1%}<br>
   Trades: {len(ledger)} events, {len(closed)} round-trips &nbsp;|&nbsp;
-  Beat SPY: {'yes' if summary.get('beat_spy') else 'no'}{cap_block}
+  Beat SPY: {'yes' if summary.get('beat_spy') else 'no'}{prof_block}{uni_block}{inv_block}{cap_block}
 </div>
 {main_html}
 <h2>Animated equity curve</h2>

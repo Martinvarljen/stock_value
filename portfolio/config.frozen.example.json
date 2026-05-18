@@ -1,0 +1,16 @@
+{
+  "_comment": "Copy to config.frozen.json after threshold sweep on TRAIN years only. Use for OOS backtests without retuning.",
+  "oos_train_through_year": 2022,
+  "oos_test_from_year": 2023,
+  "sweep_artifact": "reports/threshold_sweep/latest.json",
+  "profile": "conservative",
+  "cfd_leverage": 1,
+  "min_p_up_long": 0.58,
+  "long_quintile_min": 4,
+  "long_p_up_quintile_5_floor": 0.54,
+  "max_new_entries_per_day": 3,
+  "stop_loss_pct": 0.16,
+  "use_trailing_stop": true,
+  "trailing_stop_pct": 0.14,
+  "max_hold_days": 25
+}
