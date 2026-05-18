@@ -1,4 +1,4 @@
-"""Load portfolio config with optional research/conservative profile overlays."""
+"""Load portfolio config (production strategy: research_ls long+short 5x)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Any
 from portfolio.store import CONFIG_PATH, PORTFOLIO_DIR
 
 PROFILES_DIR = PORTFOLIO_DIR / "profiles"
-VALID_PROFILES = frozenset({"research", "conservative", "research_ls"})
+VALID_PROFILES = frozenset({"research_ls"})
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -30,18 +30,26 @@ def profile_path(name: str) -> Path:
 
 
 def load_config(*, profile: str | None = None) -> dict[str, Any]:
-    """Load ``config.json`` and optionally merge a named profile overlay."""
+    """Load ``config.json`` and optionally merge a named profile overlay.
+
+    When ``profile`` is omitted, ``default_profile`` from ``config.json`` is
+    applied (paper + backtest share one strategy). Pass ``profile=""`` to load
+    base config only with no overlay.
+    """
     if CONFIG_PATH.is_file():
         cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     else:
         cfg = {}
-    if profile:
-        path = profile_path(profile)
+    effective = profile
+    if effective is None:
+        effective = cfg.get("default_profile")
+    if effective:
+        path = profile_path(str(effective))
         if not path.is_file():
             raise FileNotFoundError(f"Profile file missing: {path}")
         overlay = json.loads(path.read_text(encoding="utf-8"))
         cfg = _deep_merge(cfg, overlay)
-        cfg["profile"] = profile
+        cfg["profile"] = str(effective)
     return cfg
 
 

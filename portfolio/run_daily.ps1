@@ -1,4 +1,4 @@
-# Morning paper-trading run (stateless; state in portfolio/data/)
+# Paper trade — research_ls (long+short 5x), same rules as winning agent backtest
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot\..
 

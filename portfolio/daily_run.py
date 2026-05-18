@@ -216,10 +216,9 @@ def run_daily(
     universe: str,
     include_news: bool | None,
     force: bool = False,
-    profile: str | None = None,
 ) -> None:
     ensure_data_dirs()
-    cfg = load_config(profile=profile)
+    cfg = load_config()
     state = load_state(cfg)
     run_date = date.today()
     daily_cfg = cfg.get("daily_run") or {}
@@ -436,15 +435,9 @@ def main() -> None:
         action="store_true",
         help="Allow a second run on the same calendar day (overwrites run audit)",
     )
-    ap.add_argument(
-        "--profile",
-        choices=("research", "conservative", "research_ls"),
-        default=None,
-        help="Config overlay: research (5x long), research_ls (5x long+short), conservative (1x)",
-    )
     args = ap.parse_args()
 
-    cfg = load_config(profile=args.profile)
+    cfg = load_config()
     universe = args.universe or cfg.get("universe", "top100")
     include_news = None
     if args.news:
@@ -459,7 +452,6 @@ def main() -> None:
         universe=universe,
         include_news=include_news,
         force=args.force,
-        profile=args.profile,
     )
 
 

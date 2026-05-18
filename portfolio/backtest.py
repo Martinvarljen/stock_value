@@ -184,7 +184,6 @@ def run_backtest(
     out_json: Path | None = None,
     out_flow_html: Path | None = None,
     initial_capital: float | None = None,
-    profile: str | None = None,
     universe_source: str | None = None,
     frozen_config_path: Path | None = None,
     skip_invariants: bool = False,
@@ -195,9 +194,7 @@ def run_backtest(
         cfg = _json.loads(frozen_config_path.read_text(encoding="utf-8"))
         cfg["_frozen_config"] = str(frozen_config_path)
     else:
-        defaults = (load_config().get("backtest_defaults") or {})
-        prof = profile or defaults.get("profile")
-        cfg = load_config(profile=prof)
+        cfg = load_config()
     uni_src = (
         universe_source
         or cfg.get("backtest_defaults", {}).get("universe_source")
@@ -547,18 +544,6 @@ def run_backtest(
     return summary
 
 
-def _print_profile_comparison(rows: list[dict]) -> None:
-    print("\n=== Profile comparison ===")
-    for r in rows:
-        cagr = r.get("strategy_cagr")
-        cagr_s = f"{cagr:.1%}" if cagr is not None else "n/a"
-        print(
-            f"  {r.get('profile', '?'):12}  leverage={r.get('cfd_leverage')}x  "
-            f"CAGR={cagr_s}  maxDD={r.get('strategy_max_dd', 0):.1%}  "
-            f"final_NAV={r.get('final_nav', 0):.4f}"
-        )
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description="Backtest portfolio daily agent vs SPY.")
     ap.add_argument("--from-year", type=int, default=2015)
@@ -572,17 +557,6 @@ def main() -> None:
         type=float,
         default=None,
         help="Scale report to dollar portfolio (e.g. 10000 for $10k start)",
-    )
-    ap.add_argument(
-        "--profile",
-        choices=("research", "conservative", "research_ls"),
-        default=None,
-        help="Leverage profile: research (5x long), research_ls (5x long+short), conservative (1x)",
-    )
-    ap.add_argument(
-        "--compare-profiles",
-        action="store_true",
-        help="Run research (5x) and conservative (1x) back-to-back and print comparison",
     )
     ap.add_argument(
         "--universe-source",
@@ -600,38 +574,22 @@ def main() -> None:
     args = ap.parse_args()
 
     stamp = datetime.today().strftime("%Y%m%d")
-    profiles = ("research", "conservative") if args.compare_profiles else (args.profile,)
-    summaries: list[dict] = []
-
-    for i, prof in enumerate(profiles):
-        suffix = f"_{prof}" if args.compare_profiles else ""
-        out = args.out_html or (_ROOT / f"portfolio_agent_report_{stamp}{suffix}.html")
-        if args.compare_profiles and args.out_html:
-            out = args.out_html.with_stem(f"{args.out_html.stem}_{prof}")
-        out_json = args.out_json or (_ROOT / f"portfolio_agent_trades_{stamp}{suffix}.json")
-        if args.compare_profiles and args.out_json:
-            out_json = args.out_json.with_stem(f"{args.out_json.stem}_{prof}")
-        out_flow = _ROOT / f"portfolio_agent_flow_{stamp}{suffix}.html"
-        if args.compare_profiles and i > 0:
-            out_flow = None
-        summary = run_backtest(
-            from_year=args.from_year,
-            to_year=args.to_year,
-            max_tickers=args.max_tickers if args.max_tickers > 0 else None,
-            signal_step=max(1, args.signal_step),
-            out_html=out if (i == 0 or args.compare_profiles) else None,
-            out_json=out_json if (i == 0 or args.compare_profiles) else None,
-            out_flow_html=out_flow if i == 0 else None,
-            initial_capital=args.initial_capital,
-            profile=prof,
-            universe_source=args.universe_source,
-            frozen_config_path=args.frozen_config,
-            skip_invariants=args.skip_invariants,
-        )
-        summaries.append(summary)
-
-    if args.compare_profiles and len(summaries) > 1:
-        _print_profile_comparison(summaries)
+    out = args.out_html or (_ROOT / f"portfolio_agent_report_{stamp}.html")
+    out_json = args.out_json or (_ROOT / f"portfolio_agent_trades_{stamp}.json")
+    out_flow = _ROOT / f"portfolio_agent_flow_{stamp}.html"
+    run_backtest(
+        from_year=args.from_year,
+        to_year=args.to_year,
+        max_tickers=args.max_tickers if args.max_tickers > 0 else None,
+        signal_step=max(1, args.signal_step),
+        out_html=out,
+        out_json=out_json,
+        out_flow_html=out_flow,
+        initial_capital=args.initial_capital,
+        universe_source=args.universe_source,
+        frozen_config_path=args.frozen_config,
+        skip_invariants=args.skip_invariants,
+    )
 
 
 if __name__ == "__main__":
