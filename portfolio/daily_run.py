@@ -24,8 +24,13 @@ if str(_ROOT) not in sys.path:
 
 from portfolio.analyze import analyze_ticker, market_regime
 from portfolio.broker import apply_decisions
+from portfolio.data_gates import filter_for_bad_ohlcv
+from portfolio.decision_schema import DecisionReport
 from portfolio.decisions import Action, decide_universe, prioritize_entries
+from portfolio.memory_log import DecisionMemoryLog
+from portfolio.reflection import OutcomeContext, reflect_on_outcome
 from portfolio.store import (
+    DATA_DIR,
     ensure_data_dirs,
     load_config,
     load_state,
@@ -34,7 +39,118 @@ from portfolio.store import (
     write_daily_notes,
     write_snapshot,
 )
+from portfolio.trailing_stop import update_open_trailing_stops
 from portfolio.universe import resolve_tickers
+
+import pandas as pd
+import yfinance as yf
+
+
+_DEFAULT_MEMORY_LOG = DATA_DIR / "decision_memory.md"
+
+
+def _memory_log_for(cfg: dict) -> DecisionMemoryLog:
+    path = cfg.get("memory_log_path") or _DEFAULT_MEMORY_LOG
+    cap = cfg.get("memory_log_max_entries")
+    return DecisionMemoryLog(path, max_entries=cap)
+
+
+def _fetch_window(ticker: str, start: str, end: str) -> pd.DataFrame | None:
+    """Daily closes between ``start`` and ``end`` (inclusive). None on failure."""
+    try:
+        df = yf.Ticker(ticker).history(start=start, end=end, interval="1d", auto_adjust=True)
+        if df is None or df.empty or "Close" not in df.columns:
+            return None
+        if getattr(df.index, "tz", None) is not None:
+            df.index = df.index.tz_localize(None)
+        return df.sort_index()
+    except Exception:
+        return None
+
+
+def _resolve_pending_entries(
+    memory: DecisionMemoryLog,
+    *,
+    run_date: date,
+    benchmark: str = "SPY",
+    min_holding_days: int = 5,
+) -> int:
+    """Resolve any pending memory-log entries whose horizon has elapsed.
+
+    For each pending entry, fetch ``ticker`` and ``benchmark`` closes from
+    the trade date through today, compute raw and alpha returns, build a
+    deterministic reflection, then atomically rewrite the log. Entries
+    that don't yet have enough trading days simply stay pending.
+
+    Returns the number of entries resolved.
+    """
+    pending = memory.get_pending_entries()
+    if not pending:
+        return 0
+
+    # Group by trade_date so we fetch SPY only once per date.
+    end = (run_date + timedelta(days=1)).isoformat()
+    spy_cache: dict[str, pd.DataFrame] = {}
+
+    updates: list[dict] = []
+    for e in pending:
+        try:
+            entry_dt = date.fromisoformat(e.date)
+        except ValueError:
+            continue
+        if (run_date - entry_dt).days < min_holding_days:
+            continue
+
+        start = entry_dt.isoformat()
+        stock = _fetch_window(e.ticker, start, end)
+        if stock is None or len(stock) < 2:
+            continue
+
+        bench = spy_cache.get(start)
+        if bench is None:
+            bench = _fetch_window(benchmark, start, end)
+            if bench is not None:
+                spy_cache[start] = bench
+        if bench is None or len(bench) < 2:
+            continue
+
+        try:
+            p0 = float(stock["Close"].iloc[0])
+            p1 = float(stock["Close"].iloc[-1])
+            b0 = float(bench["Close"].iloc[0])
+            b1 = float(bench["Close"].iloc[-1])
+        except (KeyError, IndexError, TypeError):
+            continue
+        if p0 <= 0 or b0 <= 0:
+            continue
+
+        raw = (p1 - p0) / p0
+        bench_ret = (b1 - b0) / b0
+        alpha = raw - bench_ret
+        holding_days = (run_date - entry_dt).days
+
+        ctx = OutcomeContext(
+            ticker=e.ticker,
+            trade_date=e.date,
+            rating=e.rating,
+            action=e.rating,  # action no longer parseable from tag, fall back to rating
+            raw_return=raw,
+            alpha_return=alpha,
+            holding_days=holding_days,
+            benchmark=benchmark,
+        )
+        updates.append({
+            "ticker": e.ticker,
+            "trade_date": e.date,
+            "raw_return": raw,
+            "alpha_return": alpha,
+            "holding_days": holding_days,
+            "reflection": reflect_on_outcome(ctx),
+        })
+
+    if not updates:
+        return 0
+    return memory.batch_update_with_outcomes(updates)
 
 
 def _build_notes_for_tomorrow(
@@ -116,6 +232,12 @@ def run_daily(
             print(f"  • {b}")
         print()
 
+    memory = _memory_log_for(cfg)
+    min_hold = int(cfg.get("memory_min_holding_days", cfg.get("estimated_hold_days", 5)))
+    n_resolved = _resolve_pending_entries(memory, run_date=run_date, min_holding_days=min_hold)
+    if n_resolved:
+        print(f"Memory: resolved {n_resolved} pending decision(s) with realised outcomes.\n")
+
     regime = market_regime(datetime.combine(run_date, datetime.min.time()))
     print(f"=== Daily agent {run_date.isoformat()} ===")
     print(f"Regime: SPY {'above' if regime['spy_bull'] else 'below'} 200d MA → scale {regime['gross_exposure_scale']:.0%}\n")
@@ -136,12 +258,97 @@ def run_daily(
         if a:
             analyses.append(a)
 
+    analyses, dropped_ohlcv = filter_for_bad_ohlcv(analyses)
+    if dropped_ohlcv:
+        print(
+            f"OHLCV gate: dropped {len(dropped_ohlcv)} ticker(s) with broken bars "
+            f"({', '.join(tk for tk, _ in dropped_ohlcv[:8])}"
+            f"{'…' if len(dropped_ohlcv) > 8 else ''})."
+        )
+
     cfg_run = {**cfg, "_regime_scale": regime["gross_exposure_scale"]}
+    analyses_by_tk = {a["ticker"].upper(): a for a in analyses if a.get("ok")}
+
+    def _daily_bar_hl(ticker: str):
+        a = analyses_by_tk.get(ticker.upper())
+        if not a:
+            return None
+        hi, lo = a.get("bar_high"), a.get("bar_low")
+        if hi is None or lo is None:
+            return None
+        return float(hi), float(lo)
+
+    update_open_trailing_stops(state, bar_fetcher=_daily_bar_hl, cfg=cfg_run)
     decisions = decide_universe(analyses, state, regime, cfg_run, run_date)
     decisions = prioritize_entries(decisions, cfg_run)
 
+    # Pre-trade portfolio-level risk limits (gross / sector / beta /
+    # VaR). Decisions that would breach a cap get downgraded to
+    # NO_TRADE here with a structured reason so the memory log can
+    # surface "we wanted to but the limits said no".
+    from portfolio.risk_limits import RiskLimits, apply_pre_trade_limits
+    _limits_cfg = cfg_run.get("risk_limits") or {}
+    if _limits_cfg.get("enabled", True):
+        limits = RiskLimits.from_cfg(_limits_cfg)
+        analyses_by_tk = {a["ticker"].upper(): a for a in analyses if a.get("ok")}
+        decisions, dropped_by_limits = apply_pre_trade_limits(
+            decisions, state, limits=limits, cfg=cfg_run,
+            sector_lookup=lambda tk: (analyses_by_tk.get(tk.upper(), {}) or {}).get("sector"),
+            beta_lookup=lambda tk: (analyses_by_tk.get(tk.upper(), {}) or {}).get("beta"),
+            vol_lookup=lambda tk: (analyses_by_tk.get(tk.upper(), {}) or {}).get("vol_60d_annual"),
+        )
+        if dropped_by_limits:
+            print(f"Pre-trade risk limits dropped {len(dropped_by_limits)} entrie(s):")
+            for d in dropped_by_limits[:5]:
+                print(f"  - {d['ticker']}: {d['reason']}")
+
     ledger_rows = apply_decisions(state, decisions, run_date=run_date, cfg=cfg_run)
     save_state(state)
+
+    analyses_by_ticker = {a["ticker"].upper(): a for a in analyses if a.get("ok")}
+
+    n_stored = 0
+    for d in decisions:
+        if d.action == Action.NO_TRADE:
+            continue
+        had_pos = bool(state.position_for(d.ticker))
+        past_ctx = memory.get_past_context(d.ticker)
+        analysis = analyses_by_ticker.get(d.ticker.upper(), {})
+        extras: dict = {}
+        explanation = analysis.get("explanation_one_liner")
+        if explanation:
+            extras["explanation"] = explanation
+        if analysis.get("classification"):
+            extras["classification"] = analysis["classification"]
+        if analysis.get("projection_signal"):
+            extras["projection_signal"] = analysis["projection_signal"]
+
+        setup = analysis.get("trade_setup") or {}
+        if setup.get("available"):
+            bias = setup.get("bias_summary")
+            if bias:
+                extras["setup_bias"] = bias
+            levels = [
+                lv for lv in (setup.get("watch_levels") or [])
+                if isinstance(lv.get("price"), (int, float))
+            ][:4]
+            if levels:
+                extras["watch_levels"] = ", ".join(
+                    f"{lv['name']}={lv['price']:.2f}" for lv in levels
+                )
+
+        report = DecisionReport.from_decision(
+            d,
+            trade_date=run_date,
+            regime=regime,
+            had_position=had_pos,
+            past_context=past_ctx,
+            extras=extras,
+        )
+        if memory.store_decision(report):
+            n_stored += 1
+    if n_stored:
+        print(f"Memory: stored {n_stored} new decision(s) as pending → {memory.path}")
 
     notes = _build_notes_for_tomorrow(run_date, regime, decisions, ledger_rows, state, cfg)
     notes_path = write_daily_notes(run_date + timedelta(days=1), notes)
@@ -176,7 +383,7 @@ def run_daily(
     print(f"\nNAV {state.nav:.4f} | cash {state.cash:.4f} | positions {len(state.positions)}")
     print(f"Notes for tomorrow → {notes_path}")
     print(f"Snapshot → {snap_path}")
-    print("\nWeekly report: python portfolio/weekly_report.py")
+    print("\nWeekly report: python reporting/weekly_report.py")
 
 
 def main() -> None:

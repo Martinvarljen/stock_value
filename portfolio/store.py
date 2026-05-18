@@ -40,12 +40,16 @@ class Position:
     side: str  # "long" | "short"
     entry_date: str
     entry_price: float
-    notional: float
+    notional: float  # CFD exposure (margin × leverage)
     stop_price: float
     take_profit_price: float
     max_hold_days: int
     p_up_20d_at_entry: float | None = None
     entry_reason: str = ""
+    margin: float | None = None  # cash reserved (``None`` => legacy 1× row)
+    initial_stop_price: float | None = None  # fixed stop at entry (before trail ratchet)
+    peak_price: float | None = None  # long: high-water mark for trailing
+    trough_price: float | None = None  # short: low-water mark for trailing
 
     def days_held(self, as_of: date | None = None) -> int:
         d0 = date.fromisoformat(self.entry_date)
@@ -57,6 +61,14 @@ class Position:
         by_horizon = max(0, default_horizon - held)
         by_max = max(0, self.max_hold_days - held)
         return min(by_horizon, by_max)
+
+    def position_margin(self) -> float:
+        """Cash reserved for this CFD leg."""
+        return float(self.margin) if self.margin is not None else self.notional
+
+    def short_margin(self) -> float:
+        """Alias for ``position_margin`` (shorts)."""
+        return self.position_margin()
 
 
 @dataclass

@@ -32,15 +32,17 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import backtesting.strategy_backtest as st
-from backtesting.regime import gross_exposure_scale, spy_bull_regime, spy_close_series
+from backtesting.regime import gross_exposure_scale, regime_signal, spy_bull_regime, spy_close_series
 from backtesting.yearly_top100_universe import default_universe_cache_dir, load_universe_map_for_lag_years
 from portfolio.broker import apply_decisions, mark_nav_prices
 from portfolio.decisions import Action, TickerDecision, decide_ticker, prioritize_entries, _quintile_map
 from portfolio.score_pt import score_ticker_at
-from portfolio.backtest_flow_html import write_flow_map_html
-from portfolio.backtest_viz import write_backtest_report
-from portfolio.decision_trace import stage_path_ids, trace_pipeline_stages
+from reporting.backtest_flow_html import write_flow_map_html
+from reporting.backtest_viz import write_backtest_report
+from reporting.decision_trace import stage_path_ids, trace_pipeline_stages
 from portfolio.store import default_state, load_config
+from portfolio.exit_policy import take_profit_enabled
+from portfolio.trailing_stop import stop_exit_label, update_open_trailing_stops
 
 
 def _norm_day(ts) -> datetime:
@@ -63,10 +65,32 @@ def _row_asof(df: pd.DataFrame, d: datetime) -> pd.Series | None:
     return df.iloc[pos]
 
 
+def _risk_fields_from_bar(row: pd.Series, ph: pd.DataFrame) -> dict[str, float | None]:
+    """ATR% and 60d vol for broker sizing (backtest path; mirrors analyze_ticker)."""
+    out: dict[str, float | None] = {
+        "bar_low": float(row["Low"]),
+        "bar_high": float(row["High"]),
+        "bar_open": float(row["Open"]) if "Open" in row.index and pd.notna(row["Open"]) else None,
+    }
+    cl = float(row["Close"])
+    if cl <= 0:
+        return out
+    tail = ph.tail(60)
+    if len(tail) >= 15:
+        hl = (tail["High"] - tail["Low"]).tail(14).mean()
+        out["atr_pct"] = float(hl / cl) if hl and math.isfinite(hl) else None
+    if len(tail) >= 21:
+        rets = tail["Close"].pct_change().dropna()
+        if len(rets) >= 20:
+            out["vol_60d_annual"] = float(rets.std(ddof=1) * math.sqrt(252))
+    return out
+
+
 def _intraday_exit_decisions(
     state,
     d: date,
     raw_by: dict,
+    cfg: dict | None = None,
 ) -> list[TickerDecision]:
     out: list[TickerDecision] = []
     dt = datetime.combine(d, datetime.min.time())
@@ -88,21 +112,25 @@ def _intraday_exit_decisions(
             exit_px, reason = cl, f"Max hold {pos.max_hold_days}d"
         elif pos.side == "long":
             if lo <= pos.stop_price:
-                exit_px, reason = pos.stop_price, "Stop hit (long)"
-            elif hi >= pos.take_profit_price:
+                exit_px, reason = pos.stop_price, stop_exit_label(pos)
+            elif cfg and take_profit_enabled(cfg) and hi >= pos.take_profit_price:
                 exit_px, reason = pos.take_profit_price, "Take-profit (long)"
         else:
             if hi >= pos.stop_price:
-                exit_px, reason = pos.stop_price, "Stop hit (short)"
-            elif lo <= pos.take_profit_price:
+                exit_px, reason = pos.stop_price, stop_exit_label(pos)
+            elif cfg and take_profit_enabled(cfg) and lo <= pos.take_profit_price:
                 exit_px, reason = pos.take_profit_price, "Take-profit (short)"
         if exit_px is not None:
+            risk = _risk_fields_from_bar(row, ph)
             out.append(
                 TickerDecision(
                     ticker=pos.ticker,
                     action=Action.EXIT,
                     reason=reason,
-                    price=exit_px,
+                    price=float(cl),
+                    intraday_low=risk.get("bar_low"),
+                    intraday_high=risk.get("bar_high"),
+                    open_price=risk.get("bar_open"),
                 )
             )
     return out
@@ -215,6 +243,11 @@ def run_backtest(
                 except Exception:
                     sc = None
                 if sc:
+                    ph = raw.get("price_history")
+                    if ph is not None and not ph.empty:
+                        brow = _row_asof(ph, dt)
+                        if brow is not None:
+                            sc = {**sc, **_risk_fields_from_bar(brow, ph)}
                     scores[tk] = sc
                     if sc.get("ok"):
                         batch.append(sc)
@@ -225,6 +258,7 @@ def run_backtest(
 
         regime = {
             "spy_bull": spy_bull_regime(spy_close, dt),
+            "regime_signal": regime_signal(spy_close, dt),
             "gross_exposure_scale": gross_exposure_scale(spy_close, dt, bear_scale=float(cfg.get("bear_scale", 0.35))),
         }
         cfg_run = {**cfg, "_regime_scale": regime["gross_exposure_scale"]}
@@ -243,14 +277,32 @@ def run_backtest(
                     if row is not None:
                         closes[tk] = float(row["Close"])
                         if sc:
-                            sc = {**sc, "price": closes[tk]}
+                            sc = {
+                                **sc,
+                                "price": closes[tk],
+                                **_risk_fields_from_bar(row, ph),
+                            }
             if sc:
                 analyses.append(sc)
 
         qmap_full = _quintile_map([a for a in analyses if a.get("ok") and a.get("ml_score") is not None])
 
+        def _bar_hl(ticker: str):
+            raw = raw_by.get(ticker)
+            if not raw:
+                return None
+            ph = raw.get("price_history")
+            if ph is None or ph.empty:
+                return None
+            row = _row_asof(ph, dt)
+            if row is None:
+                return None
+            return float(row["High"]), float(row["Low"])
+
+        update_open_trailing_stops(state, bar_fetcher=_bar_hl, cfg=cfg_run)
+
         decisions: list[TickerDecision] = []
-        forced = {x.ticker: x for x in _intraday_exit_decisions(state, d, raw_by)}
+        forced = {x.ticker: x for x in _intraday_exit_decisions(state, d, raw_by, cfg_run)}
         for a in analyses:
             tk = a["ticker"]
             pos = state.position_for(tk)
@@ -270,6 +322,23 @@ def run_backtest(
             decisions.append(dec)
 
         decisions = prioritize_entries(decisions, cfg_run)
+
+        from portfolio.risk_limits import RiskLimits, apply_pre_trade_limits
+
+        limits_cfg = cfg_run.get("risk_limits") or {}
+        if limits_cfg.get("enabled", True):
+            limits = RiskLimits.from_cfg(limits_cfg)
+            by_tk = {a["ticker"].upper(): a for a in analyses if a.get("ok")}
+            decisions, _dropped = apply_pre_trade_limits(
+                decisions,
+                state,
+                limits=limits,
+                cfg=cfg_run,
+                sector_lookup=lambda tk: (by_tk.get(tk.upper(), {}) or {}).get("sector"),
+                beta_lookup=lambda tk: (by_tk.get(tk.upper(), {}) or {}).get("beta"),
+                vol_lookup=lambda tk: (by_tk.get(tk.upper(), {}) or {}).get("vol_60d_annual"),
+            )
+
         day_rows = apply_decisions(state, decisions, run_date=d, cfg=cfg_run, write_ledger=False)
         ledger.extend(day_rows)
 

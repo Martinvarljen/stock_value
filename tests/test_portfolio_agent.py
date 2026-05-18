@@ -20,7 +20,7 @@ class TestDecisions(unittest.TestCase):
             "critical_flags": [],
         }
         regime = {"spy_bull": True, "gross_exposure_scale": 1.0}
-        cfg = {"min_p_up_long": 0.58, "long_quintile_min": 4, "regime_filter": True}
+        cfg = {"min_p_up_long": 0.60, "long_quintile_min": 4, "long_p_up_quintile_5_floor": 0.55, "regime_filter": True}
         d = decide_ticker(analysis, None, quintile=5, regime=regime, cfg=cfg, as_of=date(2026, 5, 15))
         self.assertEqual(d.action, Action.ENTER_LONG)
 
@@ -47,8 +47,14 @@ class TestDecisions(unittest.TestCase):
             analysis,
             pos,
             quintile=2,
-            regime={"gross_exposure_scale": 1.0},
-            cfg={"exit_p_up_long": 0.45, "max_hold_days": 25, "estimated_hold_days": 20},
+            regime={"spy_bull": False, "gross_exposure_scale": 0.5},
+            cfg={
+                "exit_p_up_long": 0.45,
+                "score_exit_long_only_bear_regime": False,
+                "min_hold_days_before_score_exit_long": 0,
+                "max_hold_days": 25,
+                "estimated_hold_days": 20,
+            },
             as_of=date(2026, 5, 15),
         )
         self.assertEqual(d.action, Action.EXIT)

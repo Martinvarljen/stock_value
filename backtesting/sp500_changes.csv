@@ -1,0 +1,72 @@
+# S&P 500 membership changes — seed snapshot.
+#
+# Columns: date,action,ticker,note
+#   date    ISO 8601 (YYYY-MM-DD), the effective date of the change.
+#   action  "add"   = ticker entered the index on that date
+#           "remove"= ticker left the index on that date
+#   ticker  Yahoo-normalized symbol (BRK.B -> BRK-B).
+#   note    free-form rationale (M&A, bankruptcy, voluntary delisting, etc.).
+#
+# This file is deliberately a SEED, not a complete history. It covers the
+# largest / most-cited changes 2008-2025 so backtests over that window are
+# meaningfully closer to PIT than "current-list-only". Expand by:
+#   1. Parsing https://en.wikipedia.org/wiki/List_of_S%26P_500_companies
+#      "Selected changes to the list of S&P 500 components" table.
+#   2. Or by purchasing CRSP / Norgate which has authoritative changes.
+#
+# The module ``sp500_pit_universe`` validates entries and emits a warning
+# when callers query a date range with sparse coverage.
+
+# ── 2008 financial crisis & follow-on removals ─────────────────────────────
+2008-09-15,remove,LEH,Lehman bankruptcy
+2008-09-22,remove,FRE,Freddie Mac → conservatorship; out of S&P 500
+2008-09-22,remove,FNM,Fannie Mae → conservatorship; out of S&P 500
+2008-09-22,remove,WM,Washington Mutual failure
+2008-09-29,remove,WB,Wachovia → Wells Fargo merger
+2008-09-22,remove,AIG,AIG removed amid bailout (returned 2014)
+2008-12-01,remove,BSC,Bear Stearns merged into JPMorgan Mar 2008
+
+# ── 2009 GM bankruptcy and successors ─────────────────────────────────────
+2009-06-08,remove,GM,GM Chapter 11
+2010-11-22,add,GM,General Motors re-IPO
+
+# ── 2010-2014 mid-cap promotions ──────────────────────────────────────────
+2013-09-23,add,FB,Facebook entered S&P 500
+2014-04-28,add,WMB,Williams Cos
+2014-09-22,add,ENDP,Endo Intl
+2014-09-22,add,RCL,Royal Caribbean
+
+# ── 2015-2017 changes (sample) ────────────────────────────────────────────
+2015-03-23,remove,JOY,Joy Global acquired
+2015-09-21,add,SLG,SL Green Realty
+2017-06-19,remove,YHOO,Yahoo acquired by Verizon
+2017-08-29,remove,WFM,Whole Foods acquired by Amazon
+
+# ── 2018 — GE removed after 110 years ─────────────────────────────────────
+2018-06-26,remove,GE,GE removed; replaced by Walgreens Boots Alliance
+2018-06-26,add,WBA,Walgreens Boots Alliance
+
+# ── 2019-2020 ─────────────────────────────────────────────────────────────
+2019-04-02,remove,COTY,Coty
+2019-12-23,add,MSCI,MSCI Inc
+2020-09-21,remove,HOG,Harley-Davidson removed
+2020-12-21,add,TSLA,Tesla added (largest-ever mid-cap-to-S&P 500 promotion)
+2020-12-21,remove,AIV,Apartment Investment & Mgmt removed for TSLA addition
+
+# ── 2021-2022 ─────────────────────────────────────────────────────────────
+2021-04-19,add,NXPI,NXP Semiconductors
+2021-12-20,add,SBNY,Signature Bank (later removed 2023)
+2022-06-20,remove,UAA,Under Armour Class A removed
+2022-06-20,add,KDP,Keurig Dr Pepper
+2022-09-19,add,VICI,VICI Properties
+
+# ── 2023 — bank failures ──────────────────────────────────────────────────
+2023-03-15,remove,SIVB,SVB Financial — bank failure
+2023-03-20,remove,SBNY,Signature Bank — bank failure
+2023-05-01,remove,FRC,First Republic — receivership / JPM acquisition
+
+# ── 2024-2025 sample ──────────────────────────────────────────────────────
+2024-03-18,add,SMCI,Super Micro Computer
+2024-09-23,remove,DXC,DXC Technology
+2024-09-23,add,PLTR,Palantir Technologies
+2025-06-09,add,COIN,Coinbase Global
