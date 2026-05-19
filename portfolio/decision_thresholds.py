@@ -24,14 +24,15 @@ workflow is:
 Usage
 -----
 
+    # Production agent sweep (research_ls):
+    #   python tools/run_agent_threshold_sweep.py --from-year 2018 --to-year 2022 ...
+    #
+    # Legacy dynamic sim only:
+    #   python tools/run_threshold_sweep.py ...
+
     from portfolio.decision_thresholds import (
         DEFAULT_DECISION_CFG, THRESHOLD_RANGES, sweep_decision_cfgs,
     )
-
-    base = {**DEFAULT_DECISION_CFG, "lookback_years": 5}
-    for cfg, label in sweep_decision_cfgs(base, THRESHOLD_RANGES):
-        result = run_dynamic(**cfg)
-        print(label, summarize(result))
 
 Audit pointer: the absolute-vs-cohort fallback inside ``decide_ticker``
 (see ``QUINTILE_MIN_COHORT`` in ``portfolio/decisions.py``) was added at

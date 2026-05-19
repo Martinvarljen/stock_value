@@ -247,7 +247,16 @@ def run_daily(
     print(f"=== Daily agent {run_date.isoformat()} ===")
     print(f"Regime: SPY {'above' if regime['spy_bull'] else 'below'} 200d MA → scale {regime['gross_exposure_scale']:.0%}\n")
 
-    symbols = resolve_tickers(explicit=tickers or None, universe=universe, max_tickers=max_tickers)
+    uni_src = cfg.get("universe_source") or (cfg.get("backtest_defaults") or {}).get(
+        "universe_source", "legacy"
+    )
+    symbols = resolve_tickers(
+        explicit=tickers or None,
+        universe=universe,
+        max_tickers=max_tickers,
+        universe_source=uni_src,
+        as_of=run_date,
+    )
     if not symbols:
         print("No tickers to scan.")
         return
@@ -395,6 +404,7 @@ def run_daily(
         "forced": force,
         "config_fingerprint": config_fingerprint(cfg),
         "universe": universe,
+        "universe_source": uni_src,
         "symbols_scanned": len(symbols),
         "analyses_ok": sum(1 for a in analyses if a.get("ok")),
         "ohlcv_dropped": [{"ticker": t, "errors": e} for t, e in dropped_ohlcv],
@@ -408,6 +418,12 @@ def run_daily(
         "ledger_count": len(ledger_rows),
     }
     audit_path = write_run_audit(run_date, audit)
+
+    from portfolio.paper_oos import update_after_daily_run
+
+    oos_report = update_after_daily_run(run_date, state=state, regime=regime, cfg=cfg)
+    if oos_report:
+        print(f"Paper OOS report → {oos_report}")
 
     print("\n--- Decisions ---")
     for d in sorted(decisions, key=lambda x: (x.action.value, x.ticker)):

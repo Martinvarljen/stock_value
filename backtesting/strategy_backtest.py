@@ -1,4 +1,7 @@
 """
+LEGACY RESEARCH — not the production paper agent (see text/STRATEGY_MAP.md).
+For research_ls use portfolio/backtest.py and portfolio/daily_run.py instead.
+
 strategy_backtest.py  —  Historical strategy backtesting engine
 
 Tests whether the stock_analyzer classification signals predicted future returns.

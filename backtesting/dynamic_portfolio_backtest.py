@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+LEGACY RESEARCH — not the production paper agent (see text/STRATEGY_MAP.md).
+For research_ls use portfolio/backtest.py and portfolio/daily_run.py instead.
+
 Dynamic paper portfolio vs SPY buy-and-hold.
 
 Rules (MVP, transparent defaults):

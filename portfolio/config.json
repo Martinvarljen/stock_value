@@ -48,6 +48,13 @@
   "regime_filter": true,
   "bear_scale": 0.35,
   "universe": "top100",
+  "universe_source": "pit_filter",
+  "paper_oos": {
+    "enabled": true,
+    "oos_start_date": "2026-05-18",
+    "benchmark": "SPY",
+    "nav_anchor": 1.0
+  },
   "margin_of_safety": 0.3,
   "include_news": false,
   "news_days": 3,
@@ -82,7 +89,7 @@
     "calibration_z_threshold": 2.0
   },
   "backtest_defaults": {
-    "universe_source": "legacy"
+    "universe_source": "pit_filter"
   },
   "daily_run": {
     "use_ohlcv_cache": true,

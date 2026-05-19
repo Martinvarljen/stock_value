@@ -46,7 +46,9 @@ from portfolio.config_loader import config_fingerprint
 from portfolio.store import default_state, load_config
 from portfolio.exit_policy import take_profit_enabled
 from portfolio.trailing_stop import stop_exit_label, update_open_trailing_stops
+from portfolio.regime_attribution import attribute_by_regime, attribute_costs_from_ledger
 from portfolio.universe_meta import universe_summary
+from backtesting.performance_metrics import summarize_backtest
 
 
 def _norm_day(ts) -> datetime:
@@ -491,6 +493,19 @@ def run_backtest(
     }
     summary.update(universe_summary(universe_source=uni_src, start=start, end=end))
 
+    strat_rets = df["strategy"].astype(float).pct_change().dropna().values
+    rf = float(cfg.get("risk_free_rate_annual", 0.04))
+    n_trials = cfg.get("threshold_search_trials")
+    summary["risk_metrics"] = summarize_backtest(
+        strat_rets,
+        df["strategy"].astype(float).values,
+        periods_per_year=252.0,
+        risk_free_rate_annual=rf,
+        n_trials_for_dsr=int(n_trials) if n_trials else None,
+    )
+    summary["regime_attribution"] = attribute_by_regime(df, nav_col="strategy", spy_close=spy_close)
+    summary["costs"] = attribute_costs_from_ledger(ledger)
+
     invariant_errors = validate_backtest_run(
         curve=df,
         ledger=ledger,
@@ -518,6 +533,17 @@ def run_backtest(
         print("  → Strategy beat SPY on CAGR (research only — not investment advice).")
     else:
         print("  → Strategy did not beat SPY on CAGR in this run.")
+
+    costs = summary.get("costs") or {}
+    print(f"  Modelled costs: overnight {costs.get('overnight_total', 0):.4f} | exit fees {costs.get('exit_cost_total', 0):.4f}")
+    ra = summary.get("regime_attribution", {}).get("regimes") or {}
+    for label in ("bull", "bear", "unknown"):
+        r = ra.get(label) or {}
+        if r.get("skipped"):
+            continue
+        cagr = r.get("cagr")
+        if cagr is not None:
+            print(f"  Regime {label}: CAGR {cagr:.1%} ({r.get('n_days', 0)} days)")
 
     if out_html:
         write_backtest_report(

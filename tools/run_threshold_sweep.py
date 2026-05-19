@@ -1,5 +1,13 @@
 """
-run_threshold_sweep.py — In-sample / out-of-sample threshold sweep runner.
+LEGACY: threshold sweep on ``backtesting.dynamic_portfolio_backtest`` only.
+
+**Not** the production ``research_ls`` agent. For agent threshold sweeps use::
+
+    python tools/run_agent_threshold_sweep.py ...
+
+See ``text/STRATEGY_MAP.md``.
+
+run_threshold_sweep.py — In-sample / out-of-sample threshold sweep runner (dynamic sim).
 
 Why this script exists
 ======================
@@ -30,7 +38,7 @@ Example
         --out-dir reports/sweeps/2025_q1 \\
         --top-n 100
 
-This script imports ``backtesting.dynamic_portfolio_backtest.run_dynamic``
+This script imports ``backtesting.dynamic_portfolio_backtest.run_dynamic`` (legacy sim)
 lazily so it remains usable for ``--help`` even in numpy-less sandboxes.
 """
 
