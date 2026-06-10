@@ -303,7 +303,6 @@ def run_backtest(
         regime = build_regime_snapshot(
             spy_close, dt, bear_scale=float(cfg.get("bear_scale", 0.35)),
         )
-        cfg_run = {**cfg, "_regime_scale": regime["gross_exposure_scale"]}
 
         scan = allowed | state.open_tickers()
         closes: dict[str, float] = {}
@@ -328,6 +327,26 @@ def run_backtest(
                 analyses.append(sc)
 
         qmap_full = _quintile_map([a for a in analyses if a.get("ok") and a.get("ml_score") is not None])
+
+        from portfolio.risk_scaling import (
+            apply_risk_scalar_to_regime,
+            compute_risk_scalar,
+            peak_nav_from_history,
+        )
+
+        hist_navs = [float(c["strategy"]) for c in curve]
+        peak_nav = peak_nav_from_history(state.nav, extra_peaks=hist_navs)
+        risk_report = compute_risk_scalar(
+            cfg=cfg,
+            nav=state.nav,
+            peak_nav=peak_nav,
+            analyses=analyses,
+            tickers=list(scan),
+            as_of=d,
+            use_cache=False,
+        )
+        regime = apply_risk_scalar_to_regime(regime, risk_report)
+        cfg_run = {**cfg, "_regime_scale": regime["gross_exposure_scale"]}
 
         def _bar_hl(ticker: str):
             raw = raw_by.get(ticker)

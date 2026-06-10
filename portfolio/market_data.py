@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
+
+_log = logging.getLogger(__name__)
 
 from portfolio.store import DATA_DIR
 
@@ -37,13 +40,14 @@ def fetch_history(
                 df = pd.read_feather(path)
                 if df is not None and not df.empty:
                     return df.sort_index()
-            except Exception:
-                pass
+            except (OSError, ValueError, KeyError) as exc:
+                _log.debug("OHLCV cache read failed for %s: %s", ticker, exc)
     try:
         df = yf.Ticker(ticker).history(
             start=start, end=end, interval="1d", auto_adjust=True,
         )
         if df is None or df.empty or "Close" not in df.columns:
+            _log.warning("Empty OHLCV for %s (%s to %s)", ticker, start, end)
             return None
         if getattr(df.index, "tz", None) is not None:
             df.index = df.index.tz_localize(None)
@@ -51,10 +55,11 @@ def fetch_history(
         if use_cache:
             try:
                 df.reset_index().to_feather(path)
-            except Exception:
-                pass
+            except (OSError, ValueError) as exc:
+                _log.debug("OHLCV cache write failed for %s: %s", ticker, exc)
         return df
-    except Exception:
+    except (OSError, ValueError, KeyError) as exc:
+        _log.warning("yfinance fetch failed for %s: %s", ticker, exc)
         return None
 
 

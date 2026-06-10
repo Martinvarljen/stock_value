@@ -5,12 +5,16 @@ collect_data(ticker) → dict with all raw & derived fields needed by scoring en
 All missing values are stored as None; callers must handle None gracefully.
 """
 
-import numpy as np
-import pandas as pd
-import yfinance as yf
+import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+_log = logging.getLogger(__name__)
 
 
 # ── EUR exchange rate cache ───────────────────────────────────────────────────
@@ -50,8 +54,8 @@ def get_eur_rate(currency: str) -> float | None:
             rate = float(hist["Close"].iloc[-1])
             _EUR_RATE_CACHE[currency] = rate
             return rate
-    except Exception:
-        pass
+    except (OSError, ValueError, KeyError) as exc:
+        _log.debug("EUR rate fetch failed for %s: %s", currency, exc)
     _EUR_RATE_CACHE[currency] = None
     return None
 

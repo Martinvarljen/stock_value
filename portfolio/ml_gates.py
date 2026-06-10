@@ -87,6 +87,19 @@ def evaluate_ml_gates(
             reasons.append(f"Feature baseline missing ({baseline_path}); drift not checked.")
 
     cal_path = Path(gates.get("calibration_log_path", _DEFAULT_CALIB_LOG))
+    min_spread = gates.get("min_cross_sectional_score_std")
+    if min_spread is not None:
+        scores = _collect_features(analyses).get("ml_score", [])
+        if len(scores) >= 10:
+            import statistics
+
+            std = statistics.pstdev(scores)
+            floor = float(min_spread)
+            if std < floor:
+                reasons.append(
+                    f"Cross-sectional score dispersion {std:.3f} < floor {floor:.3f}"
+                )
+
     if block_cal and cal_path.is_file():
         from projection.ml_model.walk_forward import detect_calibration_drift
 

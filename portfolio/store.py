@@ -8,6 +8,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from portfolio.atomic_io import atomic_write_json
+
 _ROOT = Path(__file__).resolve().parents[1]
 PORTFOLIO_DIR = Path(__file__).resolve().parent
 DATA_DIR = PORTFOLIO_DIR / "data"
@@ -42,7 +44,7 @@ def run_audit_exists(run_date: date) -> bool:
 def write_run_audit(run_date: date, payload: dict[str, Any]) -> Path:
     ensure_data_dirs()
     path = run_audit_path(run_date)
-    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    atomic_write_json(path, payload, default=str)
     return path
 
 
@@ -139,7 +141,7 @@ def save_state(state: PortfolioState) -> None:
         "last_run_date": state.last_run_date,
         "positions": [asdict(p) for p in state.positions],
     }
-    STATE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    atomic_write_json(STATE_PATH, payload)
 
 
 def append_ledger(entry: dict[str, Any]) -> None:
@@ -176,7 +178,7 @@ def notes_path(for_date: date) -> Path:
 def write_daily_notes(for_date: date, payload: dict[str, Any]) -> Path:
     ensure_data_dirs()
     path = notes_path(for_date)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    atomic_write_json(path, payload)
     return path
 
 
@@ -190,7 +192,7 @@ def read_daily_notes(for_date: date) -> dict[str, Any] | None:
 def write_snapshot(run_date: date, payload: dict[str, Any]) -> Path:
     ensure_data_dirs()
     path = SNAPSHOTS_DIR / f"{run_date.isoformat()}.json"
-    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    atomic_write_json(path, payload, default=str)
     return path
 
 

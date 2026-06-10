@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -268,12 +269,44 @@ def run_daily(
     mos = float(cfg.get("margin_of_safety", 0.3))
     news_days = int(cfg.get("news_days", 3))
 
-    analyses = []
-    for i, tk in enumerate(symbols, 1):
-        print(f"[{i}/{len(symbols)}] {tk} …", flush=True)
-        a = analyze_ticker(tk, margin_of_safety=mos, include_news=news, news_days=news_days)
-        if a:
-            analyses.append(a)
+    workers = int(daily_cfg.get("analysis_workers", 1))
+    fast_scan = bool(daily_cfg.get("fast_scan", True))
+    include_explanation = not fast_scan
+
+    def _scan_one(tk: str) -> dict | None:
+        return analyze_ticker(
+            tk,
+            margin_of_safety=mos,
+            include_news=news,
+            news_days=news_days,
+            include_explanation=include_explanation,
+        )
+
+    analyses: list[dict] = []
+    if workers <= 1 or len(symbols) == 1:
+        for i, tk in enumerate(symbols, 1):
+            print(f"[{i}/{len(symbols)}] {tk} …", flush=True)
+            a = _scan_one(tk)
+            if a:
+                analyses.append(a)
+    else:
+        print(f"Scanning {len(symbols)} tickers with {workers} workers …", flush=True)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_scan_one, tk): tk for tk in symbols}
+            done = 0
+            for fut in as_completed(futures):
+                done += 1
+                tk = futures[fut]
+                print(f"[{done}/{len(symbols)}] {tk} …", flush=True)
+                try:
+                    a = fut.result()
+                except Exception as exc:
+                    print(f"  ! {tk} failed: {exc}", flush=True)
+                    a = {"ticker": tk.upper(), "ok": False, "error": str(exc)}
+                if a:
+                    analyses.append(a)
+        sym_order = {tk.upper(): i for i, tk in enumerate(symbols)}
+        analyses.sort(key=lambda a: sym_order.get(str(a.get("ticker", "")).upper(), 999))
 
     analyses, dropped_ohlcv = filter_for_bad_ohlcv(analyses)
     if dropped_ohlcv:
@@ -281,6 +314,31 @@ def run_daily(
             f"OHLCV gate: dropped {len(dropped_ohlcv)} ticker(s) with broken bars "
             f"({', '.join(tk for tk, _ in dropped_ohlcv[:8])}"
             f"{'…' if len(dropped_ohlcv) > 8 else ''})."
+        )
+
+    from portfolio.risk_scaling import (
+        apply_risk_scalar_to_regime,
+        compute_risk_scalar,
+        peak_nav_from_history,
+    )
+
+    peak_nav = peak_nav_from_history(state.nav)
+    risk_report = compute_risk_scalar(
+        cfg=cfg,
+        nav=state.nav,
+        peak_nav=peak_nav,
+        analyses=analyses,
+        tickers=symbols,
+        as_of=run_date,
+        use_cache=use_cache,
+    )
+    regime = apply_risk_scalar_to_regime(regime, risk_report)
+    if risk_report.get("components"):
+        comps = risk_report["components"]
+        print(
+            f"Risk scaling: {risk_report.get('scalar', 1):.0%} "
+            f"(DD={comps.get('drawdown', 1):.2f} vol={comps.get('volatility', 1):.2f} "
+            f"spread={comps.get('spread', 1):.2f})"
         )
 
     cfg_run = {**cfg, "_regime_scale": regime["gross_exposure_scale"]}

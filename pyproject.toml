@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-value"
+version = "0.2.0"
+description = "Stock analysis, ML projection, and paper-trading agent"
+readme = "text/README.md"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["portfolio*", "backtesting*", "projection*", "stock_analyzer*", "reporting*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

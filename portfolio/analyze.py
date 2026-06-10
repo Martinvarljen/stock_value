@@ -18,13 +18,28 @@ from projection_engine import generate_projections
 from backtesting.ml_quant import ml_score_from_signal
 from backtesting.regime import build_regime_snapshot, spy_close_series
 
+import logging
+
 import pandas as pd
 import yfinance as yf
 
+_log = logging.getLogger(__name__)
 
-def load_spy_close() -> pd.Series:
-    hist = yf.Ticker("SPY").history(period="max", interval="1d")
-    return spy_close_series(hist)
+_SPY_CLOSE_CACHE: pd.Series | None = None
+
+
+def load_spy_close(*, refresh: bool = False) -> pd.Series:
+    """Session-cached SPY close series (one yfinance pull per process)."""
+    global _SPY_CLOSE_CACHE
+    if _SPY_CLOSE_CACHE is None or refresh:
+        try:
+            hist = yf.Ticker("SPY").history(period="max", interval="1d")
+            _SPY_CLOSE_CACHE = spy_close_series(hist)
+        except (OSError, ValueError, KeyError) as exc:
+            _log.warning("SPY history fetch failed: %s", exc)
+            if _SPY_CLOSE_CACHE is None:
+                raise
+    return _SPY_CLOSE_CACHE
 
 
 def market_regime(as_of: datetime | None = None) -> dict[str, Any]:
@@ -81,7 +96,7 @@ def analyze_ticker(
     score = ml_score_from_signal(sig)
 
     explanation = record.get("explanation") or {}
-    tx = record.get("technical_extended") or {}
+    tx = record.get("extended_technicals") or record.get("technical_extended") or {}
     atr_block = tx.get("atr_14") or {}
     last_bar = tx.get("last_bar") or {}
 
@@ -103,6 +118,8 @@ def analyze_ticker(
         "trade_setup": record.get("trade_setup"),
         "ohlcv_quality": record.get("ohlcv_quality"),
         "critical_flags": record.get("critical_flags") or [],
+        "sector": record.get("sector"),
+        "beta": record.get("beta"),
         # Risk inputs consumed by the broker for ATR-anchored stops + vol
         # targeted sizing. None when ``technical_extended`` is unavailable.
         "atr_pct": atr_block.get("pct_of_price"),

@@ -320,6 +320,8 @@ def train(
     purged_cv: bool = True,
     optuna_tune: bool = False,
     optuna_trials: int = 40,
+    cross_sectional: bool = False,
+    leakage_test: bool = False,
 ) -> dict:
     """
     Train LightGBM classifiers for each horizon.
@@ -365,7 +367,22 @@ def train(
     if deep:
         print("Deep mode: stronger LightGBM (more trees, slower fit).")
 
-    feat_cols = TECH_FEATURES   # only technical — available historically
+    cs_cols: list[str] = []
+    if cross_sectional and data_source == "dolt-feather":
+        from data.dolt_source import default_feather_path, load_ohlcv_feather
+        from ml_model.cross_sectional import attach_cross_sectional_features
+
+        fpath = Path(dolt_feather) if dolt_feather else default_feather_path()
+        panel = load_ohlcv_feather(fpath)
+        df = attach_cross_sectional_features(df, panel)
+        cs_cols = [
+            c for c in ("cs_diffusion_21d", "cs_ad_spread_5d", "cs_dispersion_21d")
+            if c in df.columns
+        ]
+        if cs_cols:
+            print(f"Cross-sectional features attached: {cs_cols}")
+
+    feat_cols = TECH_FEATURES + cs_cols
     models    = {}
     metrics   = {}
 
@@ -462,6 +479,21 @@ def train(
         if not cv_aucs:
             print(f"  {h}d: skipped (CV produced no valid folds)")
             continue
+
+        if leakage_test and h == 20:
+            from ml_model.leakage_test import run_permutation_leakage_test
+
+            tr_sub, va_sub = chronological_holdout_split(sub, val_fraction=0.15, horizon_days=h)
+            if len(va_sub) >= 100 and len(tr_sub) >= 200:
+                leak = run_permutation_leakage_test(
+                    tr_sub[feat_cols],
+                    tr_sub[target_col],
+                    va_sub[feat_cols],
+                    va_sub[target_col],
+                )
+                print(f"       leakage test: {leak.message}")
+                for i, ic in enumerate(leak.iterations, 1):
+                    print(f"         shuffle {i} IC={ic:.4f}")
 
         mean_auc = float(np.mean(cv_aucs))
         std_auc = float(np.std(cv_aucs))
@@ -607,6 +639,16 @@ def main():
         default=40,
         help="Optuna trials per horizon when --optuna is set",
     )
+    parser.add_argument(
+        "--cross-sectional",
+        action="store_true",
+        help="Attach panel diffusion/A-D/dispersion features (dolt-feather only)",
+    )
+    parser.add_argument(
+        "--leakage-test",
+        action="store_true",
+        help="Run permutation target leakage test on 20d horizon before saving",
+    )
     args = parser.parse_args()
 
     tickers = args.tickers
@@ -636,6 +678,8 @@ def main():
         purged_cv=args.purged_cv,
         optuna_tune=args.optuna,
         optuna_trials=args.optuna_trials,
+        cross_sectional=args.cross_sectional,
+        leakage_test=args.leakage_test,
     )
 
     if models:
