@@ -91,9 +91,12 @@ def _cagr(start, end, years):
     try:
         if start is None or end is None or years <= 0:
             return None
-        if start <= 0:
+        if start <= 0 or end <= 0:
             return None
-        return (end / start) ** (1 / years) - 1
+        ratio = end / start
+        if ratio <= 0:
+            return None
+        return ratio ** (1 / years) - 1
     except Exception:
         return None
 
@@ -370,7 +373,11 @@ def collect_data(ticker: str) -> dict:
             _, v_start = indexed[0]
             _, v_end   = indexed[-1]
             years = indexed[-1][0] - indexed[0][0]
-            if years <= 0 or (require_positive_start and v_start <= 0):
+            if years <= 0:
+                return None
+            if require_positive_start and v_start <= 0:
+                return None
+            if v_end <= 0:
                 return None
             return _cagr(v_start, v_end, years)
 

@@ -16,6 +16,8 @@
 #
 # The module ``sp500_pit_universe`` validates entries and emits a warning
 # when callers query a date range with sparse coverage.
+#
+# Last verified change in this file: 2026-05-07 (extend from S&P DJI press releases).
 
 # ── 2008 financial crisis & follow-on removals ─────────────────────────────
 2008-09-15,remove,LEH,Lehman bankruptcy
@@ -69,4 +71,59 @@
 2024-03-18,add,SMCI,Super Micro Computer
 2024-09-23,remove,DXC,DXC Technology
 2024-09-23,add,PLTR,Palantir Technologies
-2025-06-09,add,COIN,Coinbase Global
+
+# ── 2025 — full year (S&P DJI press releases) ─────────────────────────────
+2025-03-24,add,DASH,DoorDash
+2025-03-24,add,TKO,TKO Group Holdings
+2025-03-24,add,WSM,Williams-Sonoma
+2025-03-24,add,EXE,Expand Energy
+2025-03-24,remove,BWA,BorgWarner
+2025-03-24,remove,TFX,Teleflex
+2025-03-24,remove,CE,Celanese
+2025-03-24,remove,FMC,FMC Corp
+2025-05-19,add,COIN,Coinbase Global
+2025-05-19,remove,DFS,Discover Financial (Capital One merger)
+2025-07-09,add,DDOG,Datadog
+2025-07-09,remove,JNPR,Juniper Networks (HPE acquisition)
+2025-07-18,add,TTD,Trade Desk
+2025-07-18,remove,ANSS,ANSYS (Synopsys acquisition)
+2025-07-23,add,XYZ,Block Inc (rebrand from SQ)
+2025-07-23,remove,HES,Hess (Chevron acquisition)
+2025-08-28,add,IBKR,Interactive Brokers Group
+2025-08-28,remove,WBA,Walgreens Boots Alliance
+2025-09-22,add,APP,AppLovin
+2025-09-22,add,HOOD,Robinhood Markets
+2025-09-22,add,EME,Emcor Group
+2025-09-22,remove,MKTX,MarketAxess
+2025-09-22,remove,CZR,Caesars Entertainment
+2025-09-22,remove,ENPH,Enphase Energy
+2025-10-31,add,SOLS,Solstice Advanced Materials (Honeywell spinoff)
+2025-10-31,remove,KMX,CarMax
+2025-11-04,add,Q,Qnity Electronics (DuPont spinoff)
+2025-11-04,remove,EMN,Eastman Chemical
+2025-11-28,add,SNDK,Sandisk (Western Digital spinoff)
+2025-11-28,remove,IPG,Interpublic Group (Omnicom merger)
+2025-12-11,add,ARES,Ares Management
+2025-12-11,remove,K,Kellanova (Mars acquisition)
+2025-12-22,add,CRH,CRH plc
+2025-12-22,add,CVNA,Carvana
+2025-12-22,add,FIX,Comfort Systems USA
+2025-12-22,remove,LKQ,LKQ Corp
+2025-12-22,remove,SOLS,Solstice Advanced Materials (rebalance to SmallCap)
+2025-12-22,remove,MHK,Mohawk Industries
+
+# ── 2026 (through May; extend as S&P DJI publishes) ───────────────────────
+2026-02-09,add,CIEN,Ciena
+2026-02-09,remove,DAY,Dayforce (Thoma Bravo take-private)
+2026-03-23,add,VRT,Vertiv Holdings
+2026-03-23,add,LITE,Lumentum Holdings
+2026-03-23,add,COHR,Coherent
+2026-03-23,add,SATS,EchoStar
+2026-03-23,remove,MTCH,Match Group
+2026-03-23,remove,MOH,Molina Healthcare
+2026-03-23,remove,LW,Lamb Weston
+2026-03-23,remove,PAYC,Paycom Software
+2026-04-09,add,CASY,Casey's General Stores
+2026-04-09,remove,HOLX,Hologic (take-private)
+2026-05-07,add,VEEV,Veeva Systems
+2026-05-07,remove,CTRA,Coterra Energy (Devon merger)

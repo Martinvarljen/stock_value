@@ -13,7 +13,10 @@ Key features:
     volatility. A highly leveraged, volatile company shifts weight toward bear.
 """
 
-from utils import _pct, _bn, _num, _cv
+from utils import _pct, _bn, _num, _cv, capex_pct_for_valuation
+
+# Minimum WACC − terminal-growth spread for Gordon terminal value stability.
+MIN_TV_SPREAD = 0.02
 
 # ── Scenario parameter table ──────────────────────────────────────────────────
 SCENARIO_PARAMS = {
@@ -147,8 +150,8 @@ def run_scenario(
     # Safety clamps
     growth_start = max(min(growth_start, 0.40), -0.10)
     margin_start = max(min(margin_start, 0.60), -0.05)
-    if tg >= wacc:
-        tg = wacc - 0.005
+    if tg >= wacc - MIN_TV_SPREAD:
+        tg = max(0.0, wacc - MIN_TV_SPREAD)
 
     tax = max(0.0, min(tax_rate or 0.22, 0.50))
     cx  = max(0.0, min(capex_pct or 0.03, 0.30))
@@ -218,7 +221,7 @@ def run_all_scenarios(data: dict, wacc: float) -> dict:
     growth    = data.get("revenue_cagr_5y") or 0.03
     margin    = data.get("operating_margin") or 0.10
     tax       = data.get("effective_tax_rate") or 0.22
-    capex_pct = data.get("capex_pct_revenue") or 0.03
+    capex_pct = capex_pct_for_valuation(data)
     net_debt  = data.get("net_debt") or 0.0
     shares    = data.get("shares_outstanding")
 

@@ -20,13 +20,24 @@ from __future__ import annotations
 import time
 import urllib.request
 from pathlib import Path
+from typing import Literal
 
 import pandas as pd
 import yfinance as yf
 
+UniverseSource = Literal["legacy", "pit"]
 
-def default_universe_cache_dir(root: Path) -> Path:
-    return root / "backtesting" / "universes" / "dollar_volume_top100"
+
+def default_universe_cache_dir(root: Path, universe_source: UniverseSource = "legacy") -> Path:
+    sub = "dollar_volume_top100_pit" if universe_source == "pit" else "dollar_volume_top100"
+    return root / "backtesting" / "universes" / sub
+
+
+def normalize_universe_source(src: str | None) -> UniverseSource:
+    s = (src or "legacy").strip().lower()
+    if s in ("pit", "pit_top100", "sp500_pit"):
+        return "pit"
+    return "legacy"
 
 
 def normalize_yahoo_symbol(sym: str) -> str:
@@ -121,6 +132,21 @@ def build_dollar_volume_top_n(
     return [s for s, _ in scores[:top_n]]
 
 
+def build_top_n_for_year(
+    year: int,
+    *,
+    universe_source: UniverseSource = "legacy",
+    top_n: int = 100,
+    verbose: bool = True,
+) -> list[str]:
+    """Rank by dollar volume; ``pit`` uses point-in-time S&P membership pool."""
+    if universe_source == "pit":
+        from backtesting.sp500_pit_universe import pit_top_n
+
+        return pit_top_n(year, top_n=top_n, verbose=verbose)
+    return build_dollar_volume_top_n(year, top_n=top_n, verbose=verbose)
+
+
 def load_or_build_year_file(
     year: int,
     cache_dir: Path,
@@ -128,18 +154,21 @@ def load_or_build_year_file(
     auto_build: bool,
     top_n: int = 100,
     verbose: bool = True,
+    universe_source: UniverseSource = "legacy",
 ) -> list[str]:
     path = cache_dir / f"{year}.txt"
     if path.is_file():
         return read_ticker_lines(path)
     if not auto_build:
+        src_flag = " --universe-source pit" if universe_source == "pit" else ""
         raise FileNotFoundError(
             f"Missing universe file {path}. "
-            f"Run: python backtesting/build_yearly_top100_universe.py --from {year} --to {year}"
+            f"Run: python backtesting/build_yearly_top100_universe.py --from {year} --to {year}{src_flag}"
         )
     if verbose:
-        print(f"  Building universe for {year} (this may take a while)…")
-    tickers = build_dollar_volume_top_n(year, top_n=top_n, verbose=verbose)
+        label = "PIT S&P pool" if universe_source == "pit" else "current S&P 500"
+        print(f"  Building universe for {year} ({label}, may take a while)…")
+    tickers = build_top_n_for_year(year, universe_source=universe_source, top_n=top_n, verbose=verbose)
     write_ticker_lines(path, tickers)
     if verbose:
         print(f"  Wrote {len(tickers)} tickers -> {path}")
@@ -152,8 +181,15 @@ def load_universe_map_for_lag_years(
     *,
     auto_build_missing: bool,
     verbose: bool = True,
+    universe_source: UniverseSource = "legacy",
 ) -> dict[int, list[str]]:
     out: dict[int, list[str]] = {}
     for y in sorted(set(lag_years)):
-        out[y] = load_or_build_year_file(y, cache_dir, auto_build=auto_build_missing, verbose=verbose)
+        out[y] = load_or_build_year_file(
+            y,
+            cache_dir,
+            auto_build=auto_build_missing,
+            verbose=verbose,
+            universe_source=universe_source,
+        )
     return out

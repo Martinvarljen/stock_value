@@ -47,6 +47,7 @@ from portfolio.store import default_state, load_config
 from portfolio.exit_policy import take_profit_enabled
 from portfolio.trailing_stop import stop_exit_label, update_open_trailing_stops
 from portfolio.regime_attribution import attribute_by_regime, attribute_costs_from_ledger
+from portfolio.oos_validation import format_yearly_table, yearly_performance
 from portfolio.universe_meta import universe_summary
 from backtesting.performance_metrics import summarize_backtest
 
@@ -505,6 +506,9 @@ def run_backtest(
     )
     summary["regime_attribution"] = attribute_by_regime(df, nav_col="strategy", spy_close=spy_close)
     summary["costs"] = attribute_costs_from_ledger(ledger)
+    summary["yearly"] = yearly_performance(df)
+    if cfg.get("_frozen_config"):
+        summary["frozen_config"] = cfg.get("_frozen_config")
 
     invariant_errors = validate_backtest_run(
         curve=df,
@@ -544,6 +548,21 @@ def run_backtest(
         cagr = r.get("cagr")
         if cagr is not None:
             print(f"  Regime {label}: CAGR {cagr:.1%} ({r.get('n_days', 0)} days)")
+
+    yearly = summary.get("yearly") or []
+    if yearly:
+        print("\n  Calendar-year returns (strategy vs SPY buy-and-hold):")
+        for row in yearly:
+            sr = row.get("strategy_return")
+            br = row.get("spy_return")
+            flag = " ✓" if row.get("beat_spy") else ""
+            sr_s = f"{sr:+.1%}" if sr is not None else "n/a"
+            br_s = f"{br:+.1%}" if br is not None else "n/a"
+            print(f"    {row['year']}: strat {sr_s}  |  SPY {br_s}{flag}")
+        wins = sum(1 for r in yearly if r.get("beat_spy"))
+        print(f"  Beat SPY: {wins}/{len(yearly)} years")
+        if wins <= max(1, len(yearly) // 3):
+            print("  ⚠ Edge in few years only — review before trusting full-sample CAGR.")
 
     if out_html:
         write_backtest_report(

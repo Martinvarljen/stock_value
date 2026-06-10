@@ -14,7 +14,7 @@ class TestWeightedPortfolioCurve(unittest.TestCase):
             {"classification": "STRONG BUY", "fwd_6m": 0.10, "spy_fwd_6m": 0.04},
             {"classification": "BUY", "fwd_6m": 0.0, "spy_fwd_6m": 0.04},
         ]
-        r_s, r_b, n = weighted_basket_returns_at_date(same, weight_mode="tier")
+        r_s, r_b, n = weighted_basket_returns_at_date(same, weight_mode="tier", hold_months=6)
         self.assertEqual(n, 2)
         # weights 2/3 and 1/3 → stock (2/3)*0.1 + 0 = 0.0666...
         self.assertAlmostEqual(r_s, (2 / 3) * 0.10 + (1 / 3) * 0.0, places=6)
@@ -25,7 +25,7 @@ class TestWeightedPortfolioCurve(unittest.TestCase):
             {"classification": "BUY", "fwd_6m": 0.08, "spy_fwd_6m": 0.02},
             {"classification": "BUY", "fwd_6m": 0.02, "spy_fwd_6m": 0.02},
         ]
-        r_s, r_b, n = weighted_basket_returns_at_date(same, weight_mode="equal")
+        r_s, r_b, n = weighted_basket_returns_at_date(same, weight_mode="equal", hold_months=6)
         self.assertEqual(n, 2)
         self.assertAlmostEqual(r_s, 0.05, places=6)
         self.assertAlmostEqual(r_b, 0.02, places=6)
@@ -55,7 +55,7 @@ class TestWeightedPortfolioCurve(unittest.TestCase):
                 "spy_fwd_6m": 0.01,
             },
         ]
-        df = sequential_weighted_equity_curve(s, weight_mode="equal")
+        df = sequential_weighted_equity_curve(s, weight_mode="equal", hold_months=6)
         self.assertEqual(len(df), 2)
         self.assertAlmostEqual(df.iloc[0]["ret_stock"], 0.10, places=6)
         self.assertAlmostEqual(df.iloc[1]["ret_stock"], 0.05, places=6)

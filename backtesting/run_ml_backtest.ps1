@@ -4,4 +4,4 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot\..
 
-python backtesting/strategy_backtest.py --yearly-top100 --strategy ml --market-neutral
+python backtesting/strategy_backtest.py --yearly-top100 --universe-source pit --strategy ml --market-neutral

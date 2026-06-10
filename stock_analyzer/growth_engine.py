@@ -237,7 +237,7 @@ def analyze_growth(data: dict) -> dict:
 
     # ── Reinvestment effectiveness ─────────────────────────────────────────
     capex_5y = data.get("capex_5y") or [None]*5
-    avg_capex_pct = data.get("capex_pct_revenue")  # already computed in data_layer
+    avg_capex_pct = data.get("net_capex_pct_revenue") or data.get("capex_pct_revenue")
     dep_5y = data.get("depreciation_5y") or [None]*5
     reinv_ratios = []
     for d, c in zip(dep_5y, capex_5y):

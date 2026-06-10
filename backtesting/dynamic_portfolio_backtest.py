@@ -11,10 +11,10 @@ Rules (MVP, transparent defaults):
      Use ``--signal-tech-ai`` for BUY tiers from momentum/technicals + projection_engine
      (no DCF in composite; ML when a saved model exists). Use ``--no-valuation`` for DCF-off
      ``classification_engine`` only (same CLI as strategy_backtest.py).
-  2) Technical entry: first day on or after the checkpoint where Close breaks above the
-     prior N-day high (Donchian-style breakout; default N=20).
-  3) Exit: stop-loss 5% below entry close; take-profit 25% above entry ("price right" proxy);
-     or max hold 130 calendar days. Stops take precedence using that day's Low/High.
+  2) Technical entry: Close breaks above the prior N-day high; fill at the **next**
+     session's Open (no same-bar close entry).
+  3) Exit: stop-loss / take-profit via that day's Low/High; max-hold exits at next Open.
+     Commission + slippage match vector_engine defaults (1 + 2 bps per leg).
   4) Sizing: each new position uses ``position_frac`` of current NAV (default 10%), capped by
      cash and ``max_positions`` concurrent names.
   5) Benchmark: buy-and-hold SPY normalized to $1 on the first simulation day (never sold).
@@ -49,10 +49,18 @@ sys.path.insert(0, str(_ROOT / "stock_analyzer"))
 import backtesting.strategy_backtest as st
 from backtesting.regime import gross_exposure_scale, spy_close_series
 from backtesting.strategy_modes import is_ml_strategy, normalize_signal_mode, strategy_display_name
-from backtesting.yearly_top100_universe import default_universe_cache_dir, load_universe_map_for_lag_years
+from backtesting.yearly_top100_universe import (
+    default_universe_cache_dir,
+    load_universe_map_for_lag_years,
+    normalize_universe_source,
+)
 
 # (checkpoint_day, classification, optional p_up_20d for ML gate)
 CheckpointSignal = tuple[datetime, str | None, float | None]
+
+COMMISSION_BPS = 1.0
+SLIPPAGE_BPS = 2.0
+LEG_COST_RATE = (COMMISSION_BPS + SLIPPAGE_BPS) / 10_000.0
 
 
 @dataclass
@@ -93,6 +101,15 @@ def _last_signal_on_or_before(rows: list[CheckpointSignal], d: datetime) -> tupl
         else:
             break
     return best_cl, best_p
+
+
+def _next_trading_row(df: pd.DataFrame, d: datetime) -> pd.Series | None:
+    """First bar strictly after calendar day ``d`` (next session for entries/exits)."""
+    ts = pd.Timestamp(_norm_day(d))
+    pos = int(df.index.searchsorted(ts, side="right"))
+    if pos >= len(df):
+        return None
+    return df.iloc[pos]
 
 
 def _row_asof(df: pd.DataFrame, d: datetime) -> pd.Series | None:
@@ -183,6 +200,7 @@ def run_dynamic(
     out_html: Path | None,
     tickers: list[str] | None = None,
     universe_map: dict[int, list[str]] | None = None,
+    universe_source: str = "pit",
     use_valuation: bool = True,
     signal_mode: str = "dcf",
     checkpoint_freq: str | None = None,
@@ -206,11 +224,16 @@ def run_dynamic(
         raise RuntimeError("No checkpoints after filters.")
 
     lag_years = sorted({c.year - 1 for c in checkpoints})
+    uni_src = normalize_universe_source(universe_source)
     if tickers is None:
-        udir = universe_dir or default_universe_cache_dir(_ROOT)
+        udir = universe_dir or default_universe_cache_dir(_ROOT, uni_src)
         try:
             uni = load_universe_map_for_lag_years(
-                lag_years, udir, auto_build_missing=auto_build_universe, verbose=True
+                lag_years,
+                udir,
+                auto_build_missing=auto_build_universe,
+                verbose=True,
+                universe_source=uni_src,
             )
         except FileNotFoundError as e:
             raise RuntimeError(
@@ -351,9 +374,11 @@ def run_dynamic(
             elif hi >= p.take_profit:
                 exit_px = p.take_profit
             elif (d - p.entry_day).days >= max_hold_days:
-                exit_px = cl
+                nxt = _next_trading_row(df, d)
+                exit_px = float(nxt["Open"]) if nxt is not None else cl
             if exit_px is not None:
-                cash += p.shares * exit_px
+                proceeds = p.shares * exit_px
+                cash += proceeds - proceeds * LEG_COST_RATE
             else:
                 still.append(p)
         positions = still
@@ -389,17 +414,21 @@ def run_dynamic(
                     continue
                 if not _breakout_today(df, d, breakout_days):
                     continue
-                row = _row_asof(df, d)
-                if row is None:
+                next_row = _next_trading_row(df, d)
+                if next_row is None:
                     continue
-                entry = float(row["Close"])
+                entry = float(next_row["Open"])
                 if entry <= 0:
                     continue
                 notional = min(eff_frac * nav_pre, cash * 0.999)
                 if notional < 1e-4:
                     continue
+                entry_cost = notional * LEG_COST_RATE
+                if notional + entry_cost > cash:
+                    continue
                 shares = notional / entry
-                cash -= notional
+                cash -= notional + entry_cost
+                entry_day = _norm_day(next_row.name)
                 positions.append(
                     Position(
                         ticker=tk,
@@ -407,7 +436,7 @@ def run_dynamic(
                         entry_price=entry,
                         stop=entry * (1.0 - stop_loss),
                         take_profit=entry * (1.0 + take_profit),
-                        entry_day=d,
+                        entry_day=entry_day,
                         peak=entry,
                     )
                 )
@@ -462,7 +491,13 @@ def main() -> None:
     ap.add_argument("--breakout-days", type=int, default=20)
     ap.add_argument("--stop-loss", type=float, default=0.05)
     ap.add_argument("--take-profit", type=float, default=0.25)
-    ap.add_argument("--max-hold-days", type=int, default=130)
+    ap.add_argument(
+        "--hold-months",
+        type=int,
+        default=None,
+        help="Max hold in months (default 3; sets max-hold-days = months×30.44)",
+    )
+    ap.add_argument("--max-hold-days", type=int, default=None)
     ap.add_argument("--position-frac", type=float, default=0.10)
     ap.add_argument("--max-positions", type=int, default=10)
     ap.add_argument("--max-tickers", type=int, default=None, help="Limit universe size for a quick run")
@@ -508,6 +543,12 @@ def main() -> None:
         metavar="Q|M",
         help="Q=quarter-end (default), M=month-end — more frequent fundamental/signal refresh.",
     )
+    ap.add_argument(
+        "--universe-source",
+        choices=("legacy", "pit"),
+        default="pit",
+        help="legacy=today's S&P ranked by volume; pit=PIT S&P pool from sp500_changes.csv",
+    )
     args = ap.parse_args()
 
     cp_min = args.checkpoint_min_year if args.checkpoint_min_year else None
@@ -521,6 +562,11 @@ def main() -> None:
     if strat == "ml" and args.signal_tech_ai:
         entry_m = "rank"
 
+    from backtesting.strategy_backtest import DEFAULT_HOLD_MONTHS, hold_days
+
+    hm = args.hold_months if args.hold_months is not None else DEFAULT_HOLD_MONTHS
+    mhd = args.max_hold_days if args.max_hold_days is not None else hold_days(hm)
+
     try:
         p = run_dynamic(
             lookback_years=args.lookback,
@@ -530,13 +576,14 @@ def main() -> None:
             breakout_days=args.breakout_days,
             stop_loss=args.stop_loss,
             take_profit=args.take_profit,
-            max_hold_days=args.max_hold_days,
+            max_hold_days=mhd,
             position_frac=args.position_frac,
             max_positions=args.max_positions,
             max_tickers=args.max_tickers,
             out_html=args.out,
             tickers=None,
             universe_map=None,
+            universe_source=args.universe_source,
             use_valuation=not args.no_valuation,
             signal_mode=strat,
             checkpoint_freq=cp_cf,

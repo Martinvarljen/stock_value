@@ -22,8 +22,9 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from backtesting.yearly_top100_universe import (
-    build_dollar_volume_top_n,
+    build_top_n_for_year,
     default_universe_cache_dir,
+    normalize_universe_source,
     write_ticker_lines,
 )
 
@@ -44,10 +45,17 @@ def main() -> None:
         "--out-dir",
         type=Path,
         default=None,
-        help="Output directory (default: backtesting/universes/dollar_volume_top100)",
+        help="Output directory (default depends on --universe-source)",
+    )
+    ap.add_argument(
+        "--universe-source",
+        choices=("legacy", "pit"),
+        default="pit",
+        help="legacy=rank today's S&P 500; pit=rank PIT S&P pool from sp500_changes.csv (default: pit)",
     )
     args = ap.parse_args()
-    out_dir = args.out_dir or default_universe_cache_dir(_ROOT)
+    uni_src = normalize_universe_source(args.universe_source)
+    out_dir = args.out_dir or default_universe_cache_dir(_ROOT, uni_src)
 
     if args.for_checkpoints_from_year is not None:
         y0 = int(args.for_checkpoints_from_year) - 1
@@ -62,9 +70,10 @@ def main() -> None:
     if y0 > y1:
         raise SystemExit("--from must be <= --to")
 
+    print(f"Universe source: {uni_src}  ->  {out_dir}\n")
     for year in range(y0, y1 + 1):
         print(f"\n=== Year {year} ===")
-        tickers = build_dollar_volume_top_n(year, top_n=args.top, verbose=True)
+        tickers = build_top_n_for_year(year, universe_source=uni_src, top_n=args.top, verbose=True)
         path = out_dir / f"{year}.txt"
         write_ticker_lines(path, tickers)
         print(f"Wrote {len(tickers)} tickers -> {path}")

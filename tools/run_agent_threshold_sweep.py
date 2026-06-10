@@ -205,6 +205,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-tickers", type=int, default=50, help="Cap universe (50 is faster)")
     p.add_argument("--signal-step", type=int, default=5)
     p.add_argument("--out-dir", type=Path, default=Path("reports/sweeps/agent"))
+    p.add_argument(
+        "--write-frozen",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Write chosen cfg to PATH (e.g. portfolio/config.frozen.json) after OOS block",
+    )
     args = p.parse_args(argv)
 
     base = dict(DEFAULT_DECISION_CFG)
@@ -247,6 +254,22 @@ def main(argv: list[str] | None = None) -> int:
         is_results, args.out_dir, n_trials=n_trials, oos_block=oos_block,
         simulator="portfolio/backtest.py (research_ls)",
     )
+
+    if args.write_frozen and chosen and chosen.cfg:
+        from portfolio.oos_validation import write_frozen_config
+
+        extra = dict(chosen.cfg)
+        extra["sweep_label"] = chosen.label
+        extra["sweep_artifact"] = str(args.out_dir / "agent_threshold_sweep.json")
+        write_frozen_config(
+            args.write_frozen,
+            train_through_year=args.to_year,
+            oos_from_year=args.oos_from_year or (args.to_year + 1),
+            source=f"agent sweep {args.from_year}-{args.to_year}",
+            extra=extra,
+        )
+        print(f"Wrote frozen config → {args.write_frozen}")
+
     return 0
 
 

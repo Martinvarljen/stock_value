@@ -70,7 +70,9 @@ def run_vector_backtest(
     for j in range(n_r):
         equity[j + 1] = equity[j] * max(1e-12, 1.0 + net[j])
 
-    metrics = summarize_backtest(net, equity, periods_per_year=periods_per_year)
+    metrics = summarize_backtest(
+        net, equity, periods_per_year=periods_per_year, risk_free_rate_annual=0.04
+    )
     eff = sig[:n_r]
     dpos = np.diff(np.concatenate([[0.0], eff]))
     changes = int(np.sum(np.abs(dpos) > 1e-9))

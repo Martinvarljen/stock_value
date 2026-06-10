@@ -12,8 +12,18 @@ If you only paper-trade `research_ls`, use **only the production lane** below.
 | **Forward OOS track vs SPY** | `.\portfolio\run_paper_report.ps1` | `portfolio/paper_oos.py` |
 | **Config** | `portfolio/config.json` | profile `research_ls`, `universe_source: pit_filter` |
 | **One-time / refresh setup** | `.\portfolio\setup_institutional.ps1` | ML baseline + OOS report |
+| **OOS validation (freeze + test)** | `python tools/run_oos_validation.py` | See below |
 
 **Rule:** If it is not `portfolio/daily_run.py` or `portfolio/backtest.py`, it is **not** your live book.
+
+### OOS validation workflow
+
+1. **Lock config** (snapshot of `config.json` → `portfolio/config.frozen.json`):
+   `python tools/run_oos_validation.py --train-to 2022 --oos-from 2023 --oos-to 2026 --skip-is`
+   Or after a sweep: `python tools/run_agent_threshold_sweep.py ... --write-frozen portfolio/config.frozen.json`
+2. **OOS backtest only** uses frozen file: `python portfolio/backtest.py --from-year 2023 --to-year 2026 --frozen-config portfolio/config.frozen.json`
+3. **Forward paper**: `python portfolio/daily_run.py` + `portfolio/data/paper_oos/report.md`
+4. Reports include **calendar-year returns** (red flag if only 1–2 years beat SPY).
 
 ## Shared infrastructure (not separate strategies)
 

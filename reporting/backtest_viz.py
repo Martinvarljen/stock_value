@@ -326,6 +326,33 @@ def write_backtest_report(
             f"Leverage: long <b>{lev_l}x</b> / short <b>{lev_s}x</b> &nbsp;|&nbsp; "
             f"Config hash: <code>{summary.get('config_fingerprint', '—')}</code>"
         )
+    yearly_block = ""
+    yearly = summary.get("yearly") or []
+    if yearly:
+        yrows = ""
+        for r in yearly:
+            sr = r.get("strategy_return")
+            br = r.get("spy_return")
+            sr_s = f"{sr:+.1%}" if sr is not None else "n/a"
+            br_s = f"{br:+.1%}" if br is not None else "n/a"
+            beat = "✓" if r.get("beat_spy") else "—"
+            yrows += (
+                f"<tr><td>{r['year']}</td><td>{sr_s}</td><td>{br_s}</td>"
+                f"<td>{beat}</td><td>{r.get('n_days', 0)}</td></tr>"
+            )
+        wins = sum(1 for r in yearly if r.get("beat_spy"))
+        yearly_block = f"""
+<h2>Calendar-year returns</h2>
+<p>Beat SPY in <b>{wins}/{len(yearly)}</b> years. Single-year concentration is an overfit red flag.</p>
+<table><thead><tr><th>Year</th><th>Strategy</th><th>SPY</th><th>Beat</th><th>Days</th></tr></thead>
+<tbody>{yrows}</tbody></table>"""
+
+    frozen_block = ""
+    if summary.get("frozen_config"):
+        frozen_block = (
+            f"<br><b>OOS config</b>: <code>{summary.get('frozen_config')}</code>"
+        )
+
     inv_block = ""
     if summary.get("invariant_errors"):
         inv_block = (
@@ -367,9 +394,10 @@ def write_backtest_report(
   Strategy CAGR: {cagr_s_s} &nbsp;|&nbsp; SPY: {cagr_b_s}<br>
   Max DD: strategy {summary.get('strategy_max_dd', 0):.1%} &nbsp;|&nbsp; SPY {summary.get('spy_max_dd', 0):.1%}<br>
   Trades: {len(ledger)} events, {len(closed)} round-trips &nbsp;|&nbsp;
-  Beat SPY: {'yes' if summary.get('beat_spy') else 'no'}{prof_block}{uni_block}{inv_block}{cap_block}
+  Beat SPY: {'yes' if summary.get('beat_spy') else 'no'}{prof_block}{uni_block}{frozen_block}{inv_block}{cap_block}
 </div>
 {main_html}
+{yearly_block}
 <h2>Animated equity curve</h2>
 {anim_html}
 <h2>Closed trades (entry → exit)</h2>

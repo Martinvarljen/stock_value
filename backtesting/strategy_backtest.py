@@ -50,6 +50,7 @@ Yearly top-100 universe (lagged one calendar year, no look-ahead), checkpoints f
 import sys
 import os
 import math
+import logging
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -66,9 +67,12 @@ if str(_ROOT / "projection") not in sys.path:
 
 from quality_engine import analyze_quality
 
+from backtesting.overlap_stats import effective_n_for_signals, overlap_inflation_factor
 from backtesting.yearly_top100_universe import (
+    UniverseSource,
     default_universe_cache_dir,
     load_universe_map_for_lag_years,
+    normalize_universe_source,
 )
 from backtesting.strategy_modes import (
     MODE_DCF,
@@ -76,6 +80,8 @@ from backtesting.strategy_modes import (
     normalize_signal_mode,
     strategy_display_name,
 )
+logger = logging.getLogger(__name__)
+
 from backtesting.ml_quant import (
     aggregate_quintile_forward_returns,
     ml_score_from_signal,
@@ -117,31 +123,42 @@ DEFAULT_LOOKBACK   = 2        # years
 DEFAULT_TOP100_CHECKPOINT_MIN_YEAR = 2023
 CHECKPOINT_FREQ    = "Q"      # default: quarter-end; use "M" for month-end (see --checkpoint-freq)
 FORWARD_PERIODS    = [3, 6, 12]  # months
+# Default simulated hold for basket equity curve + dynamic backtest (quarterly CP → 3M non-overlap).
+DEFAULT_HOLD_MONTHS = 3
 # Clip each signal's forward return when computing tier *averages/medians* (Yahoo outliers).
 TIER_STATS_WINSOR = 0.5  # ±50%
 
 TIER_ORDER = ["STRONG BUY", "BUY", "WATCHLIST", "HOLD", "AVOID", "STRONG AVOID"]
 BUY_TIERS = frozenset({"STRONG BUY", "BUY"})
-HOLD_MONTHS = 6
-HOLD_DAYS = int(HOLD_MONTHS * 30.44)
+
+
+def hold_days(months: int) -> int:
+    return int(months * 30.44)
+
+
+def _fwd_keys(months: int) -> tuple[str, str]:
+    return f"fwd_{months}m", f"spy_fwd_{months}m"
 
 
 def weighted_basket_returns_at_date(
     signals_same_date: list[dict],
     *,
     weight_mode: str = "tier",
+    hold_months: int = DEFAULT_HOLD_MONTHS,
 ) -> tuple[float | None, float | None, int]:
     """
-    One-day basket among ``signals_same_date``: return (stock_6m, spy_6m, n_names) or (None,None,0).
+    One-day basket among ``signals_same_date``: return (stock_fwd, spy_fwd, n_names) or (None,None,0).
 
-    ``weight_mode``: ``tier`` (STRONG BUY weight 2, BUY weight 1) or ``equal``.
+    Uses ``fwd_{hold_months}m`` / ``spy_fwd_{hold_months}m`` (must match simulated hold).
+  ``weight_mode``: ``tier`` (STRONG BUY weight 2, BUY weight 1) or ``equal``.
     """
+    fk, sk = _fwd_keys(hold_months)
     eligible = [
         s
         for s in signals_same_date
         if s.get("classification") in BUY_TIERS
-        and s.get("fwd_6m") is not None
-        and s.get("spy_fwd_6m") is not None
+        and s.get(fk) is not None
+        and s.get(sk) is not None
     ]
     if not eligible:
         return None, None, 0
@@ -151,8 +168,8 @@ def weighted_basket_returns_at_date(
         raw = [2.0 if s["classification"] == "STRONG BUY" else 1.0 for s in eligible]
         tw = sum(raw)
         w = [x / tw for x in raw]
-    r_s = sum(wi * float(s["fwd_6m"]) for wi, s in zip(w, eligible))
-    r_b = sum(wi * float(s["spy_fwd_6m"]) for wi, s in zip(w, eligible))
+    r_s = sum(wi * float(s[fk]) for wi, s in zip(w, eligible))
+    r_b = sum(wi * float(s[sk]) for wi, s in zip(w, eligible))
     return r_s, r_b, len(eligible)
 
 
@@ -160,17 +177,20 @@ def sequential_weighted_equity_curve(
     signals: list[dict],
     *,
     weight_mode: str = "tier",
+    hold_months: int = DEFAULT_HOLD_MONTHS,
 ) -> pd.DataFrame:
     """
-    Non-overlapping 6M holds: at each entry, invest in a weighted basket of all BUY-tier
-    signals **on that checkpoint date**; realize ``fwd_6m`` / ``spy_fwd_6m`` after ``HOLD_DAYS``;
-    next entry is the earliest later checkpoint on or after that exit (no concurrent holds).
+    Non-overlapping holds of ``hold_months``: at each entry, invest in a weighted basket of
+    all BUY-tier signals **on that checkpoint date**; realize ``fwd_{hold_months}m`` after
+    ``hold_days(hold_months)``; next entry is the earliest later checkpoint on or after exit.
 
     Returns columns: entry_date, exit_date, n_names, ret_stock, ret_spy, equity_stock, equity_spy.
     """
+    fk, sk = _fwd_keys(hold_months)
+    hd = hold_days(hold_months)
     by_date = {}
     for s in signals:
-        if s.get("fwd_6m") is None or s.get("spy_fwd_6m") is None:
+        if s.get(fk) is None or s.get(sk) is None:
             continue
         d = s["date"]
         d = pd.Timestamp(d).to_pydatetime()
@@ -192,10 +212,12 @@ def sequential_weighted_equity_curve(
     for d in dates:
         if exit_after is not None and d < exit_after:
             continue
-        r_s, r_b, n = weighted_basket_returns_at_date(by_date[d], weight_mode=weight_mode)
+        r_s, r_b, n = weighted_basket_returns_at_date(
+            by_date[d], weight_mode=weight_mode, hold_months=hold_months
+        )
         if r_s is None or r_b is None or n == 0:
             continue
-        ex = d + timedelta(days=HOLD_DAYS)
+        ex = d + timedelta(days=hd)
         eq_s *= 1.0 + r_s
         eq_b *= 1.0 + r_b
         rows.append(
@@ -320,20 +342,23 @@ def _get_price_at(price_history: pd.DataFrame, target_date: datetime) -> float |
 
 
 def _get_forward_price(price_history: pd.DataFrame, from_date: datetime, months: int) -> float | None:
-    """Get closing price approximately `months` months after from_date."""
+    """Closing price at the first bar on/after the target date (~months forward).
+
+    Returns None when history does not extend far enough (no fallback to latest bar).
+    """
     if price_history is None or price_history.empty:
         return None
     idx = price_history.index.tz_localize(None) if price_history.index.tz else price_history.index
     target = pd.Timestamp(from_date + timedelta(days=months * 30.44))
-    from_ts = pd.Timestamp(from_date)
+    if getattr(target, "tz", None) is not None:
+        target = target.tz_localize(None)
     future = price_history[idx >= target]
     if future.empty:
-        latest = price_history[idx > from_ts]
-        if latest.empty:
-            return None
-        naive_last = idx[-1] if not latest.empty else None
-        if naive_last and (naive_last - from_ts).days >= months * 30.44 * 0.8:
-            return float(latest["Close"].iloc[-1])
+        return None
+    first_idx = pd.Timestamp(future.index[0])
+    if getattr(first_idx, "tz", None) is not None:
+        first_idx = first_idx.tz_localize(None)
+    if abs((first_idx - target).days) > 15:
         return None
     return float(future["Close"].iloc[0])
 
@@ -477,12 +502,6 @@ def reconstruct_data_at(raw: dict, as_of_date: datetime) -> dict | None:
         "price_eur": None,
     }
 
-    # Market cap approximation (shares × price at that date)
-    shares_outstanding = _safe(info.get("sharesOutstanding"))
-    result["market_cap"] = shares_outstanding * price if shares_outstanding else None
-    result["shares_outstanding"] = shares_outstanding
-    result["beta"] = _safe(info.get("beta"))
-
     # Income statement rows
     rev_s = _row(inc_a, "Total Revenue", "Revenue")
     gp_s = _row(inc_a, "Gross Profit")
@@ -530,6 +549,12 @@ def reconstruct_data_at(raw: dict, as_of_date: datetime) -> dict | None:
     result["cash_5y"] = _series_to_list(cash_s)
     result["equity_5y"] = _series_to_list(equity_s)
     result["shares_5y"] = _series_to_list(shares_s)
+    # Point-in-time shares from balance sheet; yfinance.info is today's snapshot only.
+    shares_outstanding = _last(result["shares_5y"]) or _safe(info.get("sharesOutstanding"))
+    result["shares_outstanding"] = shares_outstanding
+    result["market_cap"] = (shares_outstanding * price) if shares_outstanding else None
+    result["beta"] = _safe(info.get("beta"))  # still today's beta from info (no historical field)
+
     result["current_assets_5y"] = _series_to_list(cur_assets)
     result["current_liab_5y"] = _series_to_list(cur_liab)
     result["ocf_5y"] = _series_to_list(ocf_s)
@@ -927,7 +952,13 @@ def classify_at(
         clf_result = classify_stock(record)
         return clf_result["classification"]
 
-    except Exception as e:
+    except Exception:
+        logger.warning(
+            "classify_at failed ticker=%s date=%s",
+            data.get("ticker", "?"),
+            cp_date,
+            exc_info=True,
+        )
         return None
 
 
@@ -947,11 +978,11 @@ def _generate_checkpoints(lookback_years: int = 2, freq: str | None = None) -> l
     """Checkpoint dates going back ``lookback_years`` from today.
 
     ``freq``: ``Q`` = quarter-ends (Mar/Jun/Sep/Dec), ``M`` = calendar month-ends.
-    Last checkpoint is before ``today - 90 days`` so 3M forward returns exist.
+    Last checkpoint is before ``today - max(FORWARD_PERIODS)`` so the longest forward return exists.
     """
     freq_u = _normalize_checkpoint_freq(freq)
     today = datetime.today()
-    end = today - timedelta(days=90)
+    end = today - timedelta(days=int(max(FORWARD_PERIODS) * 30.44) + 15)
     start = today - timedelta(days=lookback_years * 365)
 
     if freq_u == "M":
@@ -1003,11 +1034,13 @@ def run_backtest(
     benchmark: str | None = "SPY",
     yearly_top100: bool = False,
     universe_cache_dir: Path | None = None,
+    universe_source: str = "pit",
     checkpoint_min_year: int | None = None,
     auto_build_missing_universe: bool = False,
     use_valuation: bool = True,
     signal_mode: str = "dcf",
     checkpoint_freq: str | None = None,
+    hold_months: int = DEFAULT_HOLD_MONTHS,
 ) -> dict:
     signal_mode = normalize_signal_mode(signal_mode)
     """
@@ -1026,6 +1059,9 @@ def run_backtest(
       - checkpoint_freq: ``Q`` (quarter-end) or ``M`` (month-end); more dates = more signals per ticker
     """
     cf = _normalize_checkpoint_freq(checkpoint_freq)
+    uni_src: UniverseSource = (
+        normalize_universe_source(universe_source) if yearly_top100 else "legacy"
+    )
 
     if checkpoint_min_year is not None:
         y_now = datetime.today().year
@@ -1038,7 +1074,7 @@ def run_backtest(
     bench_hist = _load_benchmark_history(benchmark) if benchmark else None
     bench_label = (benchmark or "").upper() if bench_hist is not None else None
 
-    udir = universe_cache_dir or default_universe_cache_dir(_ROOT)
+    udir = universe_cache_dir or default_universe_cache_dir(_ROOT, uni_src)
     universe_by_lag_year: dict[int, list[str]] | None = None
     if yearly_top100:
         if not checkpoints:
@@ -1051,6 +1087,7 @@ def run_backtest(
                 "tickers": [],
                 "benchmark": bench_label,
                 "yearly_top100": True,
+                "universe_source": uni_src,
                 "universe_by_lag_year": {},
                 "universe_map": None,
                 "universe_cache_dir": str(udir),
@@ -1064,6 +1101,7 @@ def run_backtest(
             udir,
             auto_build_missing=auto_build_missing_universe,
             verbose=True,
+            universe_source=uni_src,
         )
         all_tickers = sorted({t for y in lag_years for t in universe_by_lag_year.get(y, [])})
         if not all_tickers:
@@ -1079,9 +1117,20 @@ def run_backtest(
     print(f"  STRATEGY BACKTEST")
     print(f"{'═' * 70}")
     if yearly_top100:
+        pool_label = "PIT S&P + dollar volume" if uni_src == "pit" else "current S&P 500 + dollar volume"
         print(f"  Mode:         Yearly top-100 (lag year = checkpoint year − 1)")
+        print(f"  Universe:     {uni_src} ({pool_label})")
         print(f"  Universe dir: {udir}")
         print(f"  Union size:   {len(all_tickers)} distinct tickers across lag years")
+        if checkpoints:
+            from portfolio.universe_meta import pit_coverage
+
+            cov = pit_coverage(
+                checkpoints[0].date(),
+                checkpoints[-1].date(),
+            )
+            if cov.get("pit_warning"):
+                print(f"  PIT note:     {cov['pit_warning']}")
     else:
         print(f"  Tickers:      {len(all_tickers)} stocks")
     print(
@@ -1092,7 +1141,8 @@ def run_backtest(
         print(f"  Checkpoints:  {checkpoints[0].strftime('%Y-%m-%d')} -> {checkpoints[-1].strftime('%Y-%m-%d')}")
     if checkpoint_min_year is not None:
         print(f"  Min CP year:  {checkpoint_min_year}")
-    print(f"  Forward:      {FORWARD_PERIODS} months")
+    print(f"  Forward:      {FORWARD_PERIODS} months (tier stats)")
+    print(f"  Simulated hold: {hold_months} months (basket curve + dynamic backtest)")
     if bench_hist is not None:
         print(f"  Benchmark:    {bench_label} (excess = stock fwd − benchmark fwd)")
     else:
@@ -1204,7 +1254,7 @@ def run_backtest(
 
     # Aggregate results
     by_tier = _aggregate_by_tier(signals)
-    summary = _compute_summary(signals, by_tier)
+    summary = _compute_summary(signals, by_tier, hold_months=hold_months)
 
     uni_counts: dict[int, int] | None = None
     if universe_by_lag_year is not None:
@@ -1213,6 +1263,16 @@ def run_backtest(
     ml_quintiles = None
     if is_ml_strategy(signal_mode):
         ml_quintiles = aggregate_quintile_forward_returns(signals, horizon_months=6)
+
+    universe_meta: dict | None = None
+    if yearly_top100 and checkpoints:
+        from portfolio.universe_meta import universe_summary
+
+        universe_meta = universe_summary(
+            universe_source=uni_src,
+            start=checkpoints[0].date(),
+            end=checkpoints[-1].date(),
+        )
 
     return {
         "signals": signals,
@@ -1223,12 +1283,15 @@ def run_backtest(
         "tickers": all_tickers,
         "benchmark": bench_label,
         "yearly_top100": yearly_top100,
+        "universe_source": uni_src if yearly_top100 else None,
+        "universe_meta": universe_meta,
         "universe_by_lag_year": uni_counts or {},
         "universe_map": universe_by_lag_year if yearly_top100 else None,
         "universe_cache_dir": str(udir),
         "use_valuation": use_valuation,
         "signal_mode": "ml" if is_ml_strategy(signal_mode) else MODE_DCF,
         "checkpoint_freq": cf,
+        "hold_months": hold_months,
     }
 
 
@@ -1263,10 +1326,14 @@ def _aggregate_by_tier(signals: list[dict]) -> dict:
             returns = [s[key] for s in tier_signals if s[key] is not None]
             returns_w = [_tier_stat_clip(s[key]) for s in tier_signals if s[key] is not None]
             if returns:
+                n_raw = len(returns)
+                n_eff = effective_n_for_signals(tier_signals, period, return_key=key)
                 tier_data[f"avg_{period}m"] = sum(returns_w) / len(returns_w)
                 tier_data[f"median_{period}m"] = sorted(returns_w)[len(returns_w) // 2]
-                tier_data[f"hit_rate_{period}m"] = sum(1 for r in returns if r > 0) / len(returns)
-                tier_data[f"n_{period}m"] = len(returns)
+                tier_data[f"hit_rate_{period}m"] = sum(1 for r in returns if r > 0) / n_raw
+                tier_data[f"n_{period}m"] = n_raw
+                tier_data[f"effective_n_{period}m"] = n_eff
+                tier_data[f"overlap_factor_{period}m"] = overlap_inflation_factor(n_raw, n_eff)
                 tier_data[f"best_{period}m"] = max(returns)
                 tier_data[f"worst_{period}m"] = min(returns)
             else:
@@ -1274,6 +1341,8 @@ def _aggregate_by_tier(signals: list[dict]) -> dict:
                 tier_data[f"median_{period}m"] = None
                 tier_data[f"hit_rate_{period}m"] = None
                 tier_data[f"n_{period}m"] = 0
+                tier_data[f"effective_n_{period}m"] = 0.0
+                tier_data[f"overlap_factor_{period}m"] = None
 
         for period in FORWARD_PERIODS:
             ex_key = f"excess_fwd_{period}m"
@@ -1293,77 +1362,93 @@ def _aggregate_by_tier(signals: list[dict]) -> dict:
     return tiers
 
 
-def _compute_summary(signals: list[dict], by_tier: dict) -> dict:
+def _buy_avoid_spread(signals: list[dict], months: int) -> dict:
+    """BUY vs AVOID average forward return spread for one horizon."""
+    buy_tiers = ["STRONG BUY", "BUY"]
+    avoid_tiers = ["AVOID", "STRONG AVOID"]
+    fk = f"fwd_{months}m"
+    exk = f"excess_fwd_{months}m"
+    buy_r, avoid_r = [], []
+    buy_ex, avoid_ex = [], []
+    for s in signals:
+        r = s.get(fk)
+        if r is not None:
+            if s["classification"] in buy_tiers:
+                buy_r.append(r)
+            elif s["classification"] in avoid_tiers:
+                avoid_r.append(r)
+        ex = s.get(exk)
+        if ex is not None:
+            if s["classification"] in buy_tiers:
+                buy_ex.append(ex)
+            elif s["classification"] in avoid_tiers:
+                avoid_ex.append(ex)
+    avg_buy = sum(_tier_stat_clip(r) for r in buy_r) / len(buy_r) if buy_r else None
+    avg_avoid = sum(_tier_stat_clip(r) for r in avoid_r) / len(avoid_r) if avoid_r else None
+    spread = (avg_buy - avg_avoid) if avg_buy is not None and avg_avoid is not None else None
+    avg_buy_ex = sum(_tier_stat_clip(r) for r in buy_ex) / len(buy_ex) if buy_ex else None
+    avg_avoid_ex = sum(_tier_stat_clip(r) for r in avoid_ex) / len(avoid_ex) if avoid_ex else None
+    spread_ex = (
+        (avg_buy_ex - avg_avoid_ex) if avg_buy_ex is not None and avg_avoid_ex is not None else None
+    )
+    return {
+        f"avg_buy_{months}m": avg_buy,
+        f"avg_avoid_{months}m": avg_avoid,
+        f"buy_vs_avoid_spread_{months}m": spread,
+        f"n_buy_signals_{months}m": len(buy_r),
+        f"n_avoid_signals_{months}m": len(avoid_r),
+        f"effective_n_buy_{months}m": effective_n_for_signals(
+            [s for s in signals if s["classification"] in buy_tiers and s.get(fk) is not None],
+            months,
+        ),
+        f"effective_n_avoid_{months}m": effective_n_for_signals(
+            [s for s in signals if s["classification"] in avoid_tiers and s.get(fk) is not None],
+            months,
+        ),
+        f"avg_buy_excess_{months}m": avg_buy_ex,
+        f"avg_avoid_excess_{months}m": avg_avoid_ex,
+        f"buy_vs_avoid_excess_spread_{months}m": spread_ex,
+        f"n_buy_excess_signals_{months}m": len(buy_ex),
+        f"n_avoid_excess_signals_{months}m": len(avoid_ex),
+    }
+
+
+def _compute_summary(signals: list[dict], by_tier: dict, *, hold_months: int = DEFAULT_HOLD_MONTHS) -> dict:
     """Compute overall backtest summary statistics."""
     total_signals = len(signals)
     if total_signals == 0:
-        return {"total_signals": 0, "verdict": "No signals generated"}
+        return {"total_signals": 0, "verdict": "No signals generated", "hold_months": hold_months}
 
-    # Signal effectiveness: do buy-tier stocks beat avoid-tier stocks?
-    buy_tiers = ["STRONG BUY", "BUY"]
-    avoid_tiers = ["AVOID", "STRONG AVOID"]
-
-    buy_returns_6m = []
-    avoid_returns_6m = []
-    buy_excess_6m = []
-    avoid_excess_6m = []
-    for s in signals:
-        r = s.get("fwd_6m")
-        if r is not None:
-            if s["classification"] in buy_tiers:
-                buy_returns_6m.append(r)
-            elif s["classification"] in avoid_tiers:
-                avoid_returns_6m.append(r)
-        ex = s.get("excess_fwd_6m")
-        if ex is not None:
-            if s["classification"] in buy_tiers:
-                buy_excess_6m.append(ex)
-            elif s["classification"] in avoid_tiers:
-                avoid_excess_6m.append(ex)
-
-    avg_buy = (
-        sum(_tier_stat_clip(r) for r in buy_returns_6m) / len(buy_returns_6m) if buy_returns_6m else None
-    )
-    avg_avoid = (
-        sum(_tier_stat_clip(r) for r in avoid_returns_6m) / len(avoid_returns_6m) if avoid_returns_6m else None
-    )
-
-    spread = None
-    if avg_buy is not None and avg_avoid is not None:
-        spread = avg_buy - avg_avoid
-
-    avg_buy_excess = (
-        sum(_tier_stat_clip(r) for r in buy_excess_6m) / len(buy_excess_6m) if buy_excess_6m else None
-    )
-    avg_avoid_excess = (
-        sum(_tier_stat_clip(r) for r in avoid_excess_6m) / len(avoid_excess_6m) if avoid_excess_6m else None
-    )
-    spread_excess = None
-    if avg_buy_excess is not None and avg_avoid_excess is not None:
-        spread_excess = avg_buy_excess - avg_avoid_excess
-
-    # Classification distribution
-    distribution = {}
-    for tier in TIER_ORDER:
-        count = sum(1 for s in signals if s["classification"] == tier)
-        if count > 0:
-            distribution[tier] = count
-
-    return {
+    out: dict = {
         "total_signals": total_signals,
         "unique_tickers": len(set(s["ticker"] for s in signals)),
-        "avg_buy_6m": avg_buy,
-        "avg_avoid_6m": avg_avoid,
-        "buy_vs_avoid_spread_6m": spread,
-        "n_buy_signals": len(buy_returns_6m),
-        "n_avoid_signals": len(avoid_returns_6m),
-        "avg_buy_excess_6m": avg_buy_excess,
-        "avg_avoid_excess_6m": avg_avoid_excess,
-        "buy_vs_avoid_excess_spread_6m": spread_excess,
-        "n_buy_excess_signals": len(buy_excess_6m),
-        "n_avoid_excess_signals": len(avoid_excess_6m),
-        "distribution": distribution,
+        "hold_months": hold_months,
+        "distribution": {
+            tier: sum(1 for s in signals if s["classification"] == tier)
+            for tier in TIER_ORDER
+            if sum(1 for s in signals if s["classification"] == tier) > 0
+        },
     }
+    for months in FORWARD_PERIODS:
+        out.update(_buy_avoid_spread(signals, months))
+        out[f"effective_n_{months}m_total"] = effective_n_for_signals(signals, months)
+
+    # Legacy aliases for primary simulated hold (charts / verdict)
+    hm = hold_months
+    out["avg_buy_6m"] = out.get(f"avg_buy_{hm}m")
+    out["avg_avoid_6m"] = out.get(f"avg_avoid_{hm}m")
+    out["buy_vs_avoid_spread_6m"] = out.get(f"buy_vs_avoid_spread_{hm}m")
+    out["n_buy_signals"] = out.get(f"n_buy_signals_{hm}m")
+    out["n_avoid_signals"] = out.get(f"n_avoid_signals_{hm}m")
+    out["effective_n_buy_6m"] = out.get(f"effective_n_buy_{hm}m")
+    out["effective_n_avoid_6m"] = out.get(f"effective_n_avoid_{hm}m")
+    out["avg_buy_excess_6m"] = out.get(f"avg_buy_excess_{hm}m")
+    out["avg_avoid_excess_6m"] = out.get(f"avg_avoid_excess_{hm}m")
+    out["buy_vs_avoid_excess_spread_6m"] = out.get(f"buy_vs_avoid_excess_spread_{hm}m")
+    out["n_buy_excess_signals"] = out.get(f"n_buy_excess_signals_{hm}m")
+    out["n_avoid_excess_signals"] = out.get(f"n_avoid_excess_signals_{hm}m")
+    out["effective_n_6m_total"] = out.get(f"effective_n_{hm}m_total")
+    return out
 
 
 # ── display ───────────────────────────────────────────────────────────────────
@@ -1407,6 +1492,15 @@ def print_backtest_results(results: dict):
         f"Best/Worst/Hit use raw. STRONG AVOID can look huge when *raw* outliers skew averages — "
         f"see Best 6M (e.g. one bad quote)."
     )
+    hm = int(results.get("hold_months") or summary.get("hold_months") or DEFAULT_HOLD_MONTHS)
+    eff_tot = summary.get(f"effective_n_{hm}m_total")
+    if eff_tot is not None and summary["total_signals"] > 0:
+        print(
+            f"  Overlap:      raw signals={summary['total_signals']}, "
+            f"effective_n({hm}M)≈{eff_tot:.0f} "
+            f"(non-overlapping forward windows per ticker; use for inference, not raw N)"
+        )
+    print(f"  Simulated hold: {hm} months (basket curve / dynamic backtest; tier table still shows 3/6/12M)")
 
     # Returns by tier
     if bench:
@@ -1426,41 +1520,39 @@ def print_backtest_results(results: dict):
         avg_6 = f"{t['avg_6m']:+.1%}" if t.get("avg_6m") is not None else "  N/A "
         avg_12 = f"{t['avg_12m']:+.1%}" if t.get("avg_12m") is not None else "  N/A "
         hit_6 = f"{t['hit_rate_6m']:.0%}" if t.get("hit_rate_6m") is not None else " N/A "
+        n_eff = t.get("effective_n_6m")
+        eff_s = f" (eff≈{n_eff:.0f})" if n_eff is not None and t.get("n_6m") else ""
         if bench:
             xs = t.get("avg_excess_6m")
             xs_s = f"{xs:+.1%}" if xs is not None else "  N/A "
-            print(f"  {tier:<14} {t['count']:>6} │ {avg_3:>8} {avg_6:>8} {avg_12:>8} │ {hit_6:>7} │ {xs_s:>8}")
+            print(
+                f"  {tier:<14} {t['count']:>6}{eff_s} │ {avg_3:>8} {avg_6:>8} {avg_12:>8} │ {hit_6:>7} │ {xs_s:>8}"
+            )
         else:
-            print(f"  {tier:<14} {t['count']:>6} │ {avg_3:>8} {avg_6:>8} {avg_12:>8} │ {hit_6:>7}")
+            print(f"  {tier:<14} {t['count']:>6}{eff_s} │ {avg_3:>8} {avg_6:>8} {avg_12:>8} │ {hit_6:>7}")
 
     if bench:
         print(f"  {'─' * 78}")
     else:
         print(f"  {'─' * 66}")
 
-    # Key verdict
-    spread = summary.get("buy_vs_avoid_spread_6m")
-    print(f"\n  KEY FINDINGS:")
-    if summary.get("avg_buy_6m") is not None:
-        print(f"    • BUY-tier avg 6M return:   {summary['avg_buy_6m']:+.1%}  "
-              f"({summary['n_buy_signals']} signals)")
-    if summary.get("avg_avoid_6m") is not None:
-        print(f"    • AVOID-tier avg 6M return: {summary['avg_avoid_6m']:+.1%}  "
-              f"({summary['n_avoid_signals']} signals)")
+    # Key verdict — all forward horizons; primary simulated hold = hm
+    print(f"\n  KEY FINDINGS (BUY vs AVOID spread by forward horizon):")
+    for months in FORWARD_PERIODS:
+        sp = summary.get(f"buy_vs_avoid_spread_{months}m")
+        if sp is not None:
+            print(f"    • {months}M spread: {sp:+.1%}  "
+                  f"(n_buy={summary.get(f'n_buy_signals_{months}m', 0)})")
+
+    spread = summary.get(f"buy_vs_avoid_spread_{hm}m")
     if spread is not None:
         direction = "outperformed" if spread > 0 else "underperformed"
-        print(f"    • BUY vs AVOID spread:      {spread:+.1%}  "
-              f"(BUY {direction} AVOID by {abs(spread):.1%})")
-
         if spread > 0.05:
-            print(f"\n  VERDICT: Strategy shows positive signal value — "
-                  f"BUY classifications outperformed AVOID by {spread:.1%} over 6 months.")
+            print(f"\n  VERDICT ({hm}M simulated hold): BUY {direction} AVOID by {abs(spread):.1%}.")
         elif spread > 0:
-            print(f"\n  VERDICT: Weak positive signal — BUY marginally beat AVOID. "
-                  f"Consider widening margin of safety or refining criteria.")
+            print(f"\n  VERDICT ({hm}M hold): weak positive — BUY marginally beat AVOID.")
         else:
-            print(f"\n  VERDICT: Signal inversion detected — AVOID stocks outperformed BUY. "
-                  f"Review classification thresholds or check for value-trap bias.")
+            print(f"\n  VERDICT ({hm}M hold): signal inversion — AVOID beat BUY.")
     else:
         print(f"\n  VERDICT: Insufficient BUY/AVOID signals to compute spread.")
 
@@ -1535,7 +1627,10 @@ def export_to_excel(results: dict, filepath: str | None = None) -> str:
     ws = wb.active
     ws.title = "By Classification"
     bench = results.get("benchmark")
-    headers = ["Tier", "Signals", "Avg 3M", "Avg 6M", "Avg 12M", "Hit Rate 6M", "Best 6M", "Worst 6M"]
+    headers = [
+        "Tier", "Signals", "Eff N 6M", "Avg 3M", "Avg 6M", "Avg 12M",
+        "Hit Rate 6M", "Best 6M", "Worst 6M",
+    ]
     if bench:
         headers += ["Avg Excess 6M", "Hit Excess 6M"]
     for col, h in enumerate(headers, 1):
@@ -1548,18 +1643,19 @@ def export_to_excel(results: dict, filepath: str | None = None) -> str:
         t = results["by_tier"][tier]
         ws.cell(row=row, column=1, value=tier)
         ws.cell(row=row, column=2, value=t["count"])
-        ws.cell(row=row, column=3, value=t.get("avg_3m"))
-        ws.cell(row=row, column=4, value=t.get("avg_6m"))
-        ws.cell(row=row, column=5, value=t.get("avg_12m"))
-        ws.cell(row=row, column=6, value=t.get("hit_rate_6m"))
-        ws.cell(row=row, column=7, value=t.get("best_6m"))
-        ws.cell(row=row, column=8, value=t.get("worst_6m"))
-        last_pct_col = 8
+        ws.cell(row=row, column=3, value=t.get("effective_n_6m"))
+        ws.cell(row=row, column=4, value=t.get("avg_3m"))
+        ws.cell(row=row, column=5, value=t.get("avg_6m"))
+        ws.cell(row=row, column=6, value=t.get("avg_12m"))
+        ws.cell(row=row, column=7, value=t.get("hit_rate_6m"))
+        ws.cell(row=row, column=8, value=t.get("best_6m"))
+        ws.cell(row=row, column=9, value=t.get("worst_6m"))
+        last_pct_col = 9
         if bench:
-            ws.cell(row=row, column=9, value=t.get("avg_excess_6m"))
-            ws.cell(row=row, column=10, value=t.get("hit_rate_excess_6m"))
-            last_pct_col = 10
-        for col in range(3, last_pct_col + 1):
+            ws.cell(row=row, column=10, value=t.get("avg_excess_6m"))
+            ws.cell(row=row, column=11, value=t.get("hit_rate_excess_6m"))
+            last_pct_col = 11
+        for col in range(4, last_pct_col + 1):
             cell = ws.cell(row=row, column=col)
             if cell.value is not None:
                 cell.number_format = "0.0%"
@@ -1646,9 +1742,11 @@ def export_backtest_vs_benchmark_html(
     portfolio_weight_mode: str = "tier",
 ) -> str:
     """
-    Write a standalone Plotly HTML chart: per-signal 6M excess vs benchmark, quarterly averages,
-    and a sequential **weighted BUY basket** vs same-weight SPY (non-overlapping 6M holds).
+    Write a standalone Plotly HTML chart: per-signal excess vs benchmark, quarterly averages,
+    and a sequential **weighted BUY basket** vs SPY (non-overlapping holds of ``hold_months``).
     """
+    hm = int(results.get("hold_months") or DEFAULT_HOLD_MONTHS)
+    exk = f"excess_fwd_{hm}m"
     try:
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
@@ -1660,9 +1758,9 @@ def export_backtest_vs_benchmark_html(
     if not bench:
         return ""
 
-    signals = [s for s in results["signals"] if s.get("excess_fwd_6m") is not None]
+    signals = [s for s in results["signals"] if s.get(exk) is not None]
     if not signals:
-        print("  No 6M excess vs benchmark — skipping HTML chart (need SPY data at each signal)")
+        print(f"  No {hm}M excess vs benchmark — skipping HTML chart (need SPY data at each signal)")
         return ""
 
     if filepath is None:
@@ -1683,9 +1781,9 @@ def export_backtest_vs_benchmark_html(
         shared_xaxes=False,
         vertical_spacing=0.10,
         subplot_titles=(
-            f"6-month forward excess vs {bench} (each point = one ticker at one checkpoint)",
-            f"Average 6M excess vs {bench} by signal quarter (mean of overlapping signals in bucket)",
-            f"Cumulative $1 — sequential weighted BUY basket vs {bench} (same weights; {portfolio_weight_mode}-weighted names)",
+            f"{hm}-month forward excess vs {bench} (each point = one ticker at one checkpoint)",
+            f"Average {hm}M excess vs {bench} by signal quarter",
+            f"Cumulative $1 — sequential BUY basket vs {bench} ({hm}M non-overlapping holds; {portfolio_weight_mode} weights)",
         ),
         row_heights=[0.36, 0.28, 0.36],
     )
@@ -1697,12 +1795,12 @@ def export_backtest_vs_benchmark_html(
         fig.add_trace(
             go.Scatter(
                 x=[s["date"] for s in sub],
-                y=[s["excess_fwd_6m"] for s in sub],
+                y=[s[exk] for s in sub],
                 mode="markers",
                 name=tier,
                 marker=dict(color=tier_colors.get(tier, "#3498db"), size=7, opacity=0.75),
                 text=[f"{s['ticker']} @ {s['date'].strftime('%Y-%m-%d')}" for s in sub],
-                hovertemplate="%{text}<br>Excess 6M: %{y:.2%}<extra></extra>",
+                hovertemplate=f"%{{text}}<br>Excess {hm}M: %{{y:.2%}}<extra></extra>",
             ),
             row=1,
             col=1,
@@ -1711,19 +1809,19 @@ def export_backtest_vs_benchmark_html(
     fig.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5, row=1, col=1)
 
     df = pd.DataFrame(
-        {"date": [s["date"] for s in signals], "excess_fwd_6m": [s["excess_fwd_6m"] for s in signals]}
+        {"date": [s["date"] for s in signals], "excess": [s[exk] for s in signals]}
     )
     df["date"] = pd.to_datetime(df["date"])
     df["q_end"] = df["date"].dt.to_period("Q").dt.to_timestamp(how="end")
-    qmean = df.groupby("q_end", as_index=False)["excess_fwd_6m"].mean()
+    qmean = df.groupby("q_end", as_index=False)["excess"].mean()
 
     fig.add_trace(
         go.Bar(
             x=qmean["q_end"],
-            y=qmean["excess_fwd_6m"],
+            y=qmean["excess"],
             name="Quarter avg excess",
             marker_color="#5dade2",
-            hovertemplate="Quarter ending %{x|%Y-%m-%d}<br>Mean excess 6M: %{y:.2%}<extra></extra>",
+            hovertemplate=f"Quarter ending %{{x|%Y-%m-%d}}<br>Mean excess {hm}M: %{{y:.2%}}<extra></extra>",
         ),
         row=2,
         col=1,
@@ -1733,6 +1831,7 @@ def export_backtest_vs_benchmark_html(
     curve = sequential_weighted_equity_curve(
         results["signals"],
         weight_mode=portfolio_weight_mode if portfolio_weight_mode in ("tier", "equal") else "tier",
+        hold_months=hm,
     )
     if not curve.empty:
         fig.add_trace(
@@ -1803,12 +1902,14 @@ def main():
     classic_tickers = False
     checkpoint_min_year: int | None = None
     universe_dir: Path | None = None
+    universe_source = "pit"
     auto_build_universe = False
     portfolio_weight = "tier"
     legacy_html = False
     use_valuation = True
     signal_mode = "dcf"
     checkpoint_freq: str | None = None
+    hold_months = DEFAULT_HOLD_MONTHS
     run_market_neutral_flag = False
 
     args = sys.argv[1:]
@@ -1841,6 +1942,9 @@ def main():
         elif a == "--auto-build-universe":
             auto_build_universe = True
             i += 1
+        elif a == "--universe-source" and i + 1 < len(args):
+            universe_source = args[i + 1]
+            i += 2
         elif a == "--portfolio-weight" and i + 1 < len(args):
             portfolio_weight = args[i + 1].strip().lower()
             i += 2
@@ -1862,6 +1966,9 @@ def main():
         elif a == "--checkpoint-freq" and i + 1 < len(args):
             checkpoint_freq = args[i + 1]
             i += 2
+        elif a == "--hold-months" and i + 1 < len(args):
+            hold_months = int(args[i + 1])
+            i += 2
         elif a == "--help":
             print(__doc__)
             return
@@ -1878,7 +1985,18 @@ def main():
         and tickers_from_file is None
         and not extra_positional
     ):
-        u_check = universe_dir or default_universe_cache_dir(_ROOT)
+        pit_dir = default_universe_cache_dir(_ROOT, "pit")
+        leg_dir = default_universe_cache_dir(_ROOT, "legacy")
+        if universe_dir is not None:
+            u_check = universe_dir
+        elif pit_dir.is_dir() and any(pit_dir.glob("*.txt")):
+            u_check = pit_dir
+            universe_source = "pit"
+        elif leg_dir.is_dir() and any(leg_dir.glob("*.txt")):
+            u_check = leg_dir
+            universe_source = "legacy"
+        else:
+            u_check = pit_dir
         if u_check.is_dir() and any(u_check.glob("*.txt")):
             yearly_top100 = True
         else:
@@ -1886,7 +2004,8 @@ def main():
                 "\n  No yearly top-100 universe cache found (expected .txt per year under "
                 f"{u_check}).\n"
                 "  Falling back to the small classic ticker demo list.\n"
-                "  To use top-100: run  python backtesting/build_yearly_top100_universe.py --for-checkpoints-from-year 2023\n"
+                "  To use top-100: run  python backtesting/build_yearly_top100_universe.py "
+                "--for-checkpoints-from-year 2023 --universe-source pit\n"
             )
             classic_tickers = True
 
@@ -1931,17 +2050,20 @@ def main():
             benchmark=bm_arg,
             yearly_top100=yearly_top100,
             universe_cache_dir=universe_dir,
+            universe_source=universe_source,
             checkpoint_min_year=checkpoint_min_year,
             auto_build_missing_universe=auto_build_universe,
             use_valuation=use_valuation,
             signal_mode=signal_mode,
             checkpoint_freq=checkpoint_freq,
+            hold_months=hold_months,
         )
     except FileNotFoundError as e:
         print(f"\n  {e}")
         print(
             "\n  Yearly top-100 mode needs universe cache files. Build them, for example:\n"
-            "    python backtesting/build_yearly_top100_universe.py --for-checkpoints-from-year 2023\n"
+            "    python backtesting/build_yearly_top100_universe.py "
+            "--for-checkpoints-from-year 2023 --universe-source pit\n"
             "  Or run with an explicit ticker list / --classic-tickers.\n"
         )
         return
@@ -1969,7 +2091,8 @@ def main():
                 breakout_days=20,
                 stop_loss=0.05,
                 take_profit=0.25,
-                max_hold_days=130,
+                max_hold_days=hold_days(hold_months),
+                universe_source=universe_source,
                 position_frac=0.10,
                 max_positions=10,
                 max_tickers=None,

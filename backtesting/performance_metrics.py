@@ -170,7 +170,7 @@ def summarize_backtest(
     equity: np.ndarray,
     *,
     periods_per_year: float = 252.0,
-    risk_free_rate_annual: float = 0.0,
+    risk_free_rate_annual: float = 0.04,
     n_trials_for_dsr: int | None = None,
 ) -> dict[str, Any]:
     """

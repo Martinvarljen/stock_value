@@ -15,7 +15,7 @@ No made-up point scores. Every output is a real number or observation.
 """
 
 from scenario_engine import run_all_scenarios, run_scenario, _weighted_per_share, SCENARIO_PARAMS, print_scenarios
-from utils import _pct, _x, _bn, _num
+from utils import _pct, _x, _bn, _num, capex_pct_for_valuation
 
 # ── constants ─────────────────────────────────────────────────────────────────
 RISK_FREE_RATE   = 0.035   # EU 10Y Bund approx — update as needed
@@ -200,7 +200,7 @@ def _tv_sensitivity(data: dict, base_wacc: float) -> dict | None:
     base_growth   = data.get("revenue_cagr_5y") or 0.03
     base_margin   = data.get("operating_margin") or 0.10
     tax           = data.get("effective_tax_rate") or DEFAULT_TAX_RATE
-    capex_pct     = data.get("capex_pct_revenue") or 0.03
+    capex_pct     = capex_pct_for_valuation(data)
     net_debt      = data.get("net_debt") or 0.0
 
     wacc_steps = [base_wacc - 0.02, base_wacc - 0.01, base_wacc, base_wacc + 0.01, base_wacc + 0.02]
@@ -245,7 +245,7 @@ def _reverse_dcf(data: dict, wacc: float) -> dict | None:
 
     base_margin = data.get("operating_margin") or 0.10
     tax         = data.get("effective_tax_rate") or DEFAULT_TAX_RATE
-    capex_pct   = data.get("capex_pct_revenue") or 0.03
+    capex_pct   = capex_pct_for_valuation(data)
     net_debt    = data.get("net_debt") or 0.0
 
     # Use base-case margin mult and terminal growth; only vary growth
@@ -481,12 +481,9 @@ def analyze_valuation(
         dcf_data["revenue"]         = norm_rev
         dcf_data["revenue_cagr_5y"] = norm_growth
 
-        # Use net capex (capex − D&A) for cyclical sectors — gross capex would
-        # double-count the D&A already embedded in operating margins.
-        net_cx = data.get("net_capex_pct_revenue")
+        val_cx = capex_pct_for_valuation(data)
         gross_cx = data.get("capex_pct_revenue")
-        if net_cx is not None:
-            dcf_data["capex_pct_revenue"] = net_cx
+        dcf_data["capex_pct_revenue"] = val_cx
 
         changes = []
         if norm_rev and trailing_rev and abs(norm_rev - trailing_rev) / trailing_rev > 0.01:
@@ -497,9 +494,13 @@ def analyze_valuation(
             changes.append(
                 f"growth {_pct(trailing_growth)} → {_pct(norm_growth)} (floored at 0%)"
             )
-        if net_cx is not None and gross_cx is not None and abs(net_cx - gross_cx) > 0.005:
+        if (
+            data.get("net_capex_pct_revenue") is not None
+            and gross_cx is not None
+            and abs(val_cx - gross_cx) > 0.005
+        ):
             changes.append(
-                f"capex {_pct(gross_cx)} → {_pct(net_cx)} (net of D&A)"
+                f"capex {_pct(gross_cx)} → {_pct(val_cx)} (net of D&A)"
             )
         if changes:
             cyclical_note = (

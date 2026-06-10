@@ -92,6 +92,7 @@
     "universe_source": "pit_filter"
   },
   "daily_run": {
+    "max_tickers": 100,
     "use_ohlcv_cache": true,
     "reject_duplicate_run": true
   }

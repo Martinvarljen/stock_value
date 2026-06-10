@@ -70,6 +70,7 @@ def _resolve_pending_entries(
     run_date: date,
     benchmark: str = "SPY",
     min_holding_days: int = 5,
+    use_cache: bool = True,
 ) -> int:
     """Resolve any pending memory-log entries whose horizon has elapsed.
 
@@ -239,7 +240,9 @@ def run_daily(
 
     memory = _memory_log_for(cfg)
     min_hold = int(cfg.get("memory_min_holding_days", cfg.get("estimated_hold_days", 5)))
-    n_resolved = _resolve_pending_entries(memory, run_date=run_date, min_holding_days=min_hold)
+    n_resolved = _resolve_pending_entries(
+        memory, run_date=run_date, min_holding_days=min_hold, use_cache=use_cache
+    )
     if n_resolved:
         print(f"Memory: resolved {n_resolved} pending decision(s) with realised outcomes.\n")
 
@@ -440,9 +443,18 @@ def run_daily(
 
 
 def main() -> None:
+    cfg = load_config()
+    daily_cfg = cfg.get("daily_run") or {}
+    default_max_tickers = int(daily_cfg.get("max_tickers", 100))
+
     ap = argparse.ArgumentParser(description="Daily paper-trading agent (stateless run, file memory).")
     ap.add_argument("tickers", nargs="*", help="Explicit symbols (overrides universe)")
-    ap.add_argument("--max-tickers", type=int, default=50, help="Cap universe scan (default 50)")
+    ap.add_argument(
+        "--max-tickers",
+        type=int,
+        default=default_max_tickers,
+        help=f"Cap universe scan (default {default_max_tickers} from config daily_run.max_tickers)",
+    )
     ap.add_argument("--universe", default=None, help="top100 (default from config)")
     ap.add_argument("--news", action="store_true", help="Include FinBERT/Claude news pass")
     ap.add_argument("--no-news", action="store_true", help="Skip news even if config enables it")
@@ -453,7 +465,6 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    cfg = load_config()
     universe = args.universe or cfg.get("universe", "top100")
     include_news = None
     if args.news:

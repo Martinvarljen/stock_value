@@ -68,6 +68,17 @@ def _cv(lst: list) -> Optional[float]:
 
 # ── Financial calculations ────────────────────────────────────────────────────
 
+def capex_pct_for_valuation(data: dict, default: float = 0.03) -> float:
+    """Net capex (capex − D&A) preferred for DCF; fallback to gross capex/revenue."""
+    net = data.get("net_capex_pct_revenue")
+    if net is not None:
+        return float(net)
+    gross = data.get("capex_pct_revenue")
+    if gross is not None:
+        return float(gross)
+    return default
+
+
 def _cagr(start: Optional[float], end: Optional[float], years: float) -> Optional[float]:
     """Compound annual growth rate. Returns None if inputs are invalid."""
     try:

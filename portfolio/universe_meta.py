@@ -56,9 +56,13 @@ def universe_summary(
     out: dict[str, Any] = {
         "universe_source": src,
         "universe_description": (
-            "Yearly dollar-volume top-100 (lag year); current S&P 500 candidate pool"
+            "Yearly dollar-volume top-100 (lag year); ranks today's S&P 500 by prior-year volume"
             if src == "legacy"
-            else "Same top-100 lists filtered to S&P 500 members as-of each trade day (PIT filter)"
+            else (
+                "Yearly top-100 from PIT S&P pool (sp500_changes.csv) ranked by prior-year volume"
+                if src == "pit"
+                else "Top-100 lists filtered to S&P members as-of each trade day"
+            )
         ),
     }
     if src in ("pit", "pit_filter"):

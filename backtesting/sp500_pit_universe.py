@@ -16,10 +16,8 @@ set built from a delisted-overlay snapshot:
     └─ plus members added after their add-date
 
 The seed snapshot ships at ``backtesting/sp500_changes.csv``. It covers
-the largest / most-cited changes 2008-2025 — about 35-50 entries — and
-is deliberately incomplete; full PIT coverage requires CRSP, Norgate, or
-a Wikipedia-revision-history scrape, all of which the user can drop in
-by replacing/extending the CSV.
+the largest / most-cited changes 2008-2026 — extend from S&P DJI press
+releases when new rebalances occur.
 
 Public API
 ----------
@@ -46,6 +44,12 @@ from typing import Iterable
 
 
 _DEFAULT_CHANGES_CSV = Path(__file__).resolve().parent / "sp500_changes.csv"
+_COVERAGE_WARNED: set[tuple[str, str]] = set()
+
+
+def reset_coverage_warnings() -> None:
+    """Test helper: allow coverage warnings to fire again."""
+    _COVERAGE_WARNED.clear()
 
 
 @dataclass(frozen=True)
@@ -91,17 +95,25 @@ def load_changes(path: Path = _DEFAULT_CHANGES_CSV) -> list[Change]:
 
 
 def _coverage_warning(changes: list[Change], start: date, end: date) -> None:
-    """Warn once when the change log barely covers the query window."""
+    """Warn at most once per query window (see module docstring)."""
+    key = (start.isoformat(), end.isoformat())
+    if key in _COVERAGE_WARNED:
+        return
     if not changes:
         warnings.warn(
             "S&P 500 PIT change log is empty; falling back to current "
             "membership only (this is the survivorship-biased path).",
             stacklevel=3,
         )
+        _COVERAGE_WARNED.add(key)
         return
     log_min = changes[0].when
     log_max = changes[-1].when
     if start < log_min or end > log_max:
+        # Live daily runs after the CSV end date: membership uses current list + log;
+        # no need to spam warnings on every trading day.
+        if start >= log_min and end > log_max:
+            return
         warnings.warn(
             f"S&P 500 PIT change log covers {log_min.isoformat()}..{log_max.isoformat()} "
             f"but query window is {start.isoformat()}..{end.isoformat()}. "
@@ -109,6 +121,7 @@ def _coverage_warning(changes: list[Change], start: date, end: date) -> None:
             f"backtesting/sp500_changes.csv for full PIT coverage.",
             stacklevel=3,
         )
+        _COVERAGE_WARNED.add(key)
 
 
 # ── public API ────────────────────────────────────────────────────────────────
